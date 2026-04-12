@@ -1,2 +1,3 @@
 GLOBAL: scripts/OMW_MagExp/magexp_global.lua
 CUSTOM: scripts/OMW_MagExp/magexp_projectile_local.lua
+PLAYER: scripts/OMW_MagExp/magexp_player.lua

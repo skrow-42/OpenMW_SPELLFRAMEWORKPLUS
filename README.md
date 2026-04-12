@@ -1,4 +1,4 @@
-**# OpenMW Magicka Expanded Framework v1.1**
+# OpenMW Magicka Expanded v1.2 Framework
 
 **OpenMW's Magicka Expanded** is a standardized spell-launching engine for OpenMW Lua. It kind of dehardcodes the magic system with available methods from the API, providing a unified public interface (`I.MagExp`) for modders to trigger spell casts and effects. Using MaxYari Lua Physics as a hard dependency.
 
@@ -43,7 +43,7 @@ I.MagExp.STACK_CONFIG.SPELL_LIMITS["shield"] = 5 -- Specific spell can stack 5 t
 
 ## 3. The `data` Parameter Table
 All fields except the first four are optional.
-```
+
 | Parameter      | Type      | Default  | Description |
 | **attacker**   | `Actor`   | Required | The actor responsible for the spell. |
 | **spellId**    | `string`  | Required | The ID of the spell record to cast. |
@@ -58,8 +58,29 @@ All fields except the first four are optional.
 | **boltSound**  | `string`  | Auto     | Looping flight sound ID. |
 | **spinSpeed**  | `number`  | Auto     | Mesh rotation speed (radians per second). |
 | **boltLightId**| `string`  | Auto     | Record ID of the light attached to the bolt. |
-| **hitModel**   | `string`  | Auto     | Model path to spawn on impact. |
+| **itemRecordId**| `string` | `spellId`| Required for Items/Scrolls to handle visuals correctly. |
+| **hitObject**  | `Object`  | `nil`    | Optional priority target (e.g. from SharedRay) for Touch spells. |
+
+---
+
+## 4. Precision Targeting: `I.SharedRay` (Player)
+The framework now includes the **SharedRay** service. This provides a single, high-precision rendering raycast per frame that is shared across all mods. Using `SharedRay` ensures that Touch spells and projectiles align perfectly with the player's crosshair.
+
+### Usage in Player Scripts:
+```lua
+local I = require('openmw.interfaces')
+local ray = I.SharedRay.get()
+
+if ray.hit and ray.hitObject then
+    core.sendGlobalEvent('MagExp_CastRequest', {
+        attacker  = self,
+        spellId   = "spark",
+        hitObject = ray.hitObject, -- Pass this for pixel-perfect Touch aiming
+        -- ... other params ...
+    })
+end
 ```
+
 ---
 
 ## 4. Usage from Player/Local Scripts
@@ -84,7 +105,6 @@ core.sendGlobalEvent('MagExp_CastRequest', {
 The framework broadcasts a global event whenever a spell (Projectile, Touch, or Self) connects with a target. This allows other mods to react to magic impacts.
 
 ### `MagicHitInfo` Data Structure
-```
 | Field         | Type         | Description |
 | :---          | :---         | :--- |
 | **attacker**  | `GameObject` | The actor who cast the spell. |
@@ -99,7 +119,7 @@ The framework broadcasts a global event whenever a spell (Projectile, Touch, or 
 | **isAoE**     | `boolean`    | `true` if this hit is part of a splash/area effect. |
 | **stackLimit**| `number`     | Stacking limit for this spell on this target. |
 | **stackCount**| `number`     | Current instances on target after this hit. |
-```
+
 #### Usage Example (Global Script):
 ```lua
 core.events.addHandler('MagExp_OnMagicHit', function(info)
@@ -137,8 +157,7 @@ I.MagExp.launchSpell({
 })
 ```
 
-### C. Deciding if your spell will be a stacking one or not
-This setting with given spellId will alter the vanilla behavior of spells not being able to stack. You can choose any number of stacks to be available to apply.
+### C. Restricting Stacking from another Mod
 ```lua
 -- In your mod's initialization
 local I = require('openmw.interfaces')
