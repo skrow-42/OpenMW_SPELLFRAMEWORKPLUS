@@ -139,6 +139,8 @@ local function onUpdate(dt)
             projectile  = self,
             hitObject   = hit.hitObject,
             hitPos      = hit.hitPos,
+            hitNormal   = hit.hitNormal,
+            velocity    = velocity,
             attacker    = attacker,
             spellId     = spellId,
             area        = area,

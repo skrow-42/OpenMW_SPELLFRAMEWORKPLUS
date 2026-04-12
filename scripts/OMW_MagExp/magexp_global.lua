@@ -41,6 +41,84 @@ local STACK_CONFIG = {
 }
 
 -- ============================================================
+-- [HELPERS] Data Enrichment for Events
+-- ============================================================
+local function getSpellDamageInfo(spellId)
+    local dt = { health = 0, magicka = 0, fatigue = 0 }
+    local spell = core.magic.spells.records[spellId]
+    if not (spell and spell.effects) then return dt end
+    for _, eff in ipairs(spell.effects) do
+        local mid = eff.id:lower()
+        local mag = ((eff.magnitudeMin or 0) + (eff.magnitudeMax or eff.magnitudeMin or 0)) / 2
+        if mid:find("health") or mid:find("fire") or mid:find("frost") or mid:find("shock") or mid:find("poison") then
+            dt.health = dt.health + mag
+        elseif mid:find("magicka") then
+            dt.magicka = dt.magicka + mag
+        elseif mid:find("fatigue") then
+            dt.fatigue = dt.fatigue + mag
+        end
+    end
+    return dt
+end
+
+local function fireMagicHitEvent(data)
+    -- data expects: attacker, target, spellId, hitPos, hitNormal, spellType, isAoE, area, velocity, projectile
+    local spell = core.magic.spells.records[data.spellId]
+    if not spell then return end
+
+    local info = {
+        attacker     = data.attacker,
+        target       = data.target,
+        spellId      = data.spellId,
+        hitPos       = data.hitPos,
+        hitNormal    = data.hitNormal or util.vector3(0,0,1),
+        successful   = true,
+        sourceType   = core.magic.ATTACK_SOURCE_TYPE and core.magic.ATTACK_SOURCE_TYPE.Magic or 2, -- AttackSourceType.Magic = 2
+        spellType    = data.spellType or core.magic.RANGE.Target,
+        isAoE        = data.isAoE or false,
+        area         = data.area or 0,
+        damage       = getSpellDamageInfo(data.spellId),
+        projectile   = data.projectile,
+        velocity     = data.velocity or util.vector3(0,0,0)
+    }
+
+    -- Element & School detection
+    if spell.effects and spell.effects[1] then
+        local mgef = core.magic.effects.records[spell.effects[1].id]
+        if mgef then
+            info.school = mgef.school
+            local n = (mgef.name or ""):lower()
+            if n:find("fire") then info.element = "fire"
+            elseif n:find("frost") then info.element = "frost"
+            elseif n:find("shock") then info.element = "shock"
+            elseif n:find("poison") then info.element = "poison"
+            elseif n:find("heal") or n:find("restore") then info.element = "heal"
+            else info.element = "default" end
+        end
+    end
+
+    -- Stacking Info
+    info.stackLimit = STACK_CONFIG.SPELL_LIMITS[data.spellId] or STACK_CONFIG.DEFAULT_LIMIT
+    if info.target and info.target:isValid() then
+        local activeSpells = types.Actor.activeSpells(info.target)
+        if activeSpells then
+            local count = 0
+            for sId, _ in pairs(activeSpells) do
+                if sId == data.spellId then count = count + 1 end
+            end
+            info.stackCount = count
+        end
+    end
+
+    -- Broadcast globally
+    core.sendGlobalEvent('MagExp_OnMagicHit', info)
+    -- Send to target script if actor
+    if info.target and info.target:isValid() then
+        info.target:sendEvent('MagExp_Local_MagicHit', info)
+    end
+end
+
+-- ============================================================
 -- [CORE] Authoritative Spell Application
 -- ============================================================
 local function applySpellToActor(spellId, caster, target, hitPos, isAoe)
@@ -60,6 +138,26 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe)
     end
 
     debugLog(string.format("Applying %s to %s", spellId, target.recordId or target.id))
+
+    -- BROADCAST HIT EVENT (For Self/Touch spells that don't go through projectile logic)
+    -- If isAoe is true, it means it's being applied via detonateSpellAtPos
+    if not isAoe then
+        local spellRec = core.magic.spells.records[spellId]
+        if spellRec and spellRec.effects and spellRec.effects[1] then
+            local r = spellRec.effects[1].range
+            if r == core.magic.RANGE.Self or r == core.magic.RANGE.Touch then
+                fireMagicHitEvent({
+                    attacker  = caster,
+                    target    = target,
+                    spellId   = spellId,
+                    hitPos    = hitPos or target.position,
+                    spellType = r,
+                    isAoE     = false,
+                    area      = spellRec.effects[1].area or 0
+                })
+            end
+        end
+    end
 
     local effectIndexes = {}
     if spell.effects then
@@ -256,6 +354,16 @@ local function detonateSpellAtPos(spellId, caster, pos, cell)
                     else
                         if object.type == types.NPC or object.type == types.Creature or object.type == types.Player then
                             applySpellToActor(spellId, caster, object, pos, true)
+                            -- Broadcast AoE hit
+                            fireMagicHitEvent({
+                                attacker  = caster,
+                                target    = object,
+                                spellId   = spellId,
+                                hitPos    = pos,
+                                spellType = core.magic.RANGE.Target,
+                                isAoE     = true,
+                                area      = finalRadius
+                            })
                             affectedCount = affectedCount + 1
                         end
                     end
@@ -621,6 +729,20 @@ local function onProjectileCollision(data)
             applySpellToActor(spellId, attacker, target, hitPos, false)
         end
     end
+
+    -- BROADCAST HIT EVENT (For primary projectile impact)
+    fireMagicHitEvent({
+        attacker   = attacker,
+        target     = target,
+        spellId    = spellId,
+        hitPos     = hitPos,
+        hitNormal  = data.hitNormal,
+        velocity   = data.velocity,
+        projectile = proj,
+        spellType  = core.magic.RANGE.Target,
+        isAoE      = false,
+        area       = area
+    })
 
     if proj and proj:isValid() then
         proj:sendEvent('MagExp_StopSound')

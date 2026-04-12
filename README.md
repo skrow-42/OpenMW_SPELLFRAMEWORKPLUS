@@ -1,12 +1,11 @@
-# OpenMW Magicka Expanded Framework v1.0
+# OpenMW Magicka Expanded (OMW_MagExp) Framework Documentation
 
 **OpenMW's Magicka Expanded** is a standardized spell-launching engine for OpenMW Lua. It kind of dehardcodes the magic system with available methods from the API, providing a unified public interface (`I.MagExp`) for modders to trigger spell casts and effects. Using MaxYari Lua Physics as a hard dependency.
 
 ---
 
-## 1. Setup for Modders and Players
+## 1. Setup for Modders
 To use this framework with your mod:
-
 0. Ensure you have Max Yari Lua Physics enabled.
 1. Ensure `OpenMW_Magicka_Expanded_Framework.omwscripts` is loaded.
 2. Ensure your mod has a dependency or check for the interface.
@@ -33,11 +32,18 @@ I.MagExp.launchSpell({
 })
 ```
 
+### `STACK_CONFIG`
+You can modify how spells stack on actors globally.
+```lua
+I.MagExp.STACK_CONFIG.DEFAULT_LIMIT = 2 -- All spells stack twice by default
+I.MagExp.STACK_CONFIG.SPELL_LIMITS["shield"] = 5 -- Specific spell can stack 5 times
+```
+
 ---
 
 ## 3. The `data` Parameter Table
 All fields except the first four are optional.
-```lua
+
 | Parameter      | Type      | Default  | Description |
 | **attacker**   | `Actor`   | Required | The actor responsible for the spell. |
 | **spellId**    | `string`  | Required | The ID of the spell record to cast. |
@@ -53,7 +59,7 @@ All fields except the first four are optional.
 | **spinSpeed**  | `number`  | Auto     | Mesh rotation speed (radians per second). |
 | **boltLightId**| `string`  | Auto     | Record ID of the light attached to the bolt. |
 | **hitModel**   | `string`  | Auto     | Model path to spawn on impact. |
-```
+
 ---
 
 ## 4. Usage from Player/Local Scripts
@@ -74,7 +80,37 @@ core.sendGlobalEvent('MagExp_CastRequest', {
 
 ---
 
-## 5. Examples
+## 5. Magic Impact Events: `MagExp_OnMagicHit`
+The framework broadcasts a global event whenever a spell (Projectile, Touch, or Self) connects with a target. This allows other mods to react to magic impacts.
+
+### `MagicHitInfo` Data Structure
+| Field         | Type         | Description |
+| :---          | :---         | :--- |
+| **attacker**  | `GameObject` | The actor who cast the spell. |
+| **target**    | `GameObject` | The victim hit (Actor, Door, Static, etc). |
+| **spellId**   | `string`     | The ID of the spell. |
+| **hitPos**    | `Vector3`    | Precise coordinates of the impact. |
+| **hitNormal** | `Vector3`    | Surface normal at impact (for aligning decals). |
+| **school**    | `string`     | Magic school (e.g. "destruction"). |
+| **element**   | `string`     | fire, frost, shock, poison, heal, or default. |
+| **damage**    | `table`      | Calculated damage: `{health, magicka, fatigue}`. |
+| **spellType** | `number`     | 0=Self, 1=Touch, 2=Target. |
+| **isAoE**     | `boolean`    | `true` if this hit is part of a splash/area effect. |
+| **stackLimit**| `number`     | Stacking limit for this spell on this target. |
+| **stackCount**| `number`     | Current instances on target after this hit. |
+
+#### Usage Example (Global Script):
+```lua
+core.events.addHandler('MagExp_OnMagicHit', function(info)
+    if info.element == "fire" and info.target.recordId == "wooden_barrel" then
+        -- Burn the barrel!
+    end
+end)
+```
+
+---
+
+## 6. Examples
 
 ### A. The "Chain Lightning" Trick
 You want a spell that looks like a standard bolt but moves extremely fast and has a custom impact model.
@@ -98,6 +134,16 @@ I.MagExp.launchSpell({
     startPos  = world.getPlayer().position,
     direction = util.vector3(0,0,1)
 })
+```
+
+### C. Restricting Stacking from another Mod
+```lua
+-- In your mod's initialization
+local I = require('openmw.interfaces')
+if I.MagExp then
+    -- Make "God's Shield" unique (only 1 instance allowed)
+    I.MagExp.STACK_CONFIG.SPELL_LIMITS["gods_shield"] = 1
+end
 ```
 
 ---
