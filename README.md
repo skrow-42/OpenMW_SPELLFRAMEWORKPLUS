@@ -37,8 +37,23 @@ I.MagExp.launchSpell({
 ## 3. The `data` Parameter Table
 All fields except the first four are optional.
 
-<img width="973" height="381" alt="README md - Visual Studio Code 12 04 2026 20_36_44" src="https://github.com/user-attachments/assets/b8b107ee-e86d-428f-9a1e-d049ac3275c2" />
-
+```
+| Parameter      | Type      | Default  | Description |
+| **attacker**   | `Actor`   | Required | The actor responsible for the spell. |
+| **spellId**    | `string`  | Required | The ID of the spell record to cast. |
+| **startPos**   | `Vector3` | Required | Position where the spell/projectile spawns. |
+| **direction**  | `Vector3` | Required | Finalized flight vector. |
+| **spellType**  | `number`  | Auto     | Routing: 0=self, 1=touch, 2=target |
+| **area**       | `number`  | Auto     | Impact radius in game units, use only with AoE spells. |
+| **isFree**     | `boolean` | `false`  | Skip magicka cost check if `true`. |
+| **speed**      | `number`  | `1500`   | Speed of the projectile (units/sec). |
+| **maxLifetime**| `number`  | `10`     | Seconds until projectile is destroyed. |
+| **vfxRecId**   | `string`  | Auto     | The Record ID for the bolt (e.g. `VFX_DestructBolt`). |
+| **boltSound**  | `string`  | Auto     | Looping flight sound ID. |
+| **spinSpeed**  | `number`  | Auto     | Mesh rotation speed (radians per second). |
+| **boltLightId**| `string`  | Auto     | Record ID of the light attached to the bolt. |
+| **hitModel**   | `string`  | Auto     | Model path to spawn on impact. |
+```
 
 ---
 
