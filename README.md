@@ -1,4 +1,4 @@
-# OpenMW Magicka Expanded Framework Documentation
+# OpenMW Magicka Expanded Framework v1.0
 
 **OpenMW's Magicka Expanded** is a standardized spell-launching engine for OpenMW Lua. It kind of dehardcodes the magic system with available methods from the API, providing a unified public interface (`I.MagExp`) for modders to trigger spell casts and effects. Using MaxYari Lua Physics as a hard dependency.
 
