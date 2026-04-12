@@ -6,6 +6,7 @@
 
 ## 1. Setup for Modders
 To use this framework with your mod:
+
 0. Ensure you have Max Yari Lua Physics enabled.
 1. Ensure `OpenMW_Magicka_Expanded_Framework.omwscripts` is loaded.
 2. Ensure your mod has a dependency or check for the interface.
