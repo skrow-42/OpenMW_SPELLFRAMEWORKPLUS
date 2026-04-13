@@ -18,6 +18,8 @@ local util    = require('openmw.util')
 local storage = require('openmw.storage')
 
 local targetFilter = nil
+local activeVfxRegistry = {} 
+local casterLinkedSpells = {} -- list of {caster, target, spellId} for casterLinked effects
 
 local function debugLog(msg)
     local debugOn = storage.globalSection('SettingsMagExp_General'):get('DebugMode')
@@ -40,6 +42,13 @@ local STACK_CONFIG = {
     -- Exception definitions: specific spell IDs and how many times they can stack.
     -- Example: SPELL_LIMITS = { ["third barrier"] = 3 }
     SPELL_LIMITS = {},
+    PERSISTENT_EFFECTS = {
+        ["shield"] = true,
+        ["fireshield"] = true,
+        ["frostshield"] = true,
+        ["lightningshield"] = true,
+        ["soultrap"] = true,
+    }
 }
 
 -- ============================================================
@@ -115,21 +124,47 @@ local function fireMagicHitEvent(data)
     -- Broadcast globally
     core.sendGlobalEvent('MagExp_OnMagicHit', info)
     -- Send to target script if actor
-    if info.target and info.target:isValid() then
-        info.target:sendEvent('MagExp_Local_MagicHit', info)
+    if data.target and data.target:isValid() then
+        data.target:sendEvent('MagExp_Local_MagicHit', info)
+
+        -- Manual dispatch for specific school hit effects
+        if spell.effects and spell.effects[1] then
+            pcall(function()
+                local mgef = core.magic.effects.records[spell.effects[1].id]
+                if mgef then
+                    -- Hit Sound
+                    local snd = mgef.school:lower() .. " hit"
+                    data.target:sendEvent('PlaySound3d', { sound = snd })
+
+                    -- Primary Hit Static (The flash/hit visual)
+                    local vfxId = mgef.hitStatic
+                    if vfxId and vfxId ~= "" then
+                        local static = types.Static.records[vfxId]
+                        if static and static.model then
+                            data.target:sendEvent('AddVfx', {
+                                model = static.model,
+                                options = { mwMagicVfx = true }
+                            })
+                        end
+                    end
+                end
+            end)
+        end
     end
 end
 
 -- ============================================================
 -- [CORE] Authoritative Spell Application
 -- ============================================================
-local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemRecordId)
+local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObject)
     if not target or not target:isValid() then return end
     if not (caster and caster:isValid()) then caster = target end
     if target.type ~= types.NPC and target.type ~= types.Creature and target.type ~= types.Player then
         debugLog("applySpellToActor: Aborting - target is not an actor type")
         return
     end
+
+    print("MagExp: Applying " .. spellId .. " to " .. (target.recordId or "unknown") .. " by " .. (caster.recordId or "unknown"))
 
     local spell = core.magic.spells.records[spellId]
     local isEnchantment = false
@@ -143,10 +178,87 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemRec
         return
     end
 
+    -- Check for harmful and casterLinked flags
+    local hasHarmful = false
+    local hasCasterLinked = false
+    if spell.effects then
+        for _, eff in ipairs(spell.effects) do
+            print("MagExp: Checking effect " .. eff.id)
+            local mgef = core.magic.effects.records[eff.id]
+            if mgef then
+                if mgef.harmful then 
+                    print("MagExp: Detected harmful effect: " .. eff.id)
+                    hasHarmful = true
+                end
+                if mgef.casterLinked then 
+                    print("MagExp: Detected casterLinked effect: " .. eff.id)
+                    hasCasterLinked = true
+                end
+            else
+                print("MagExp: No mgef for " .. eff.id)
+            end
+        end
+    else
+        print("MagExp: No effects in spell")
+    end
+
+    -- [SCHOOL VISUALS] Manual dispatch for schools that struggle with global application
+    if spell.effects and spell.effects[1] then
+        pcall(function()
+            local mgef = core.magic.effects.records[spell.effects[1].id]
+            if mgef then
+                local eId = mgef.id:lower()
+                local isPersistentEffect = STACK_CONFIG.PERSISTENT_EFFECTS[eId] == true
+                local isPersistentLoop = isPersistentEffect and (spell.effects[1].duration or 0) > 0
+                local vfxId = mgef.hitStatic
+                
+                if vfxId and vfxId ~= "" then
+                    local static = types.Static.records[vfxId]
+                    if static and static.model then
+                        -- [CLEANUP REGISTRATION]
+                        if isPersistentLoop then
+                            if not activeVfxRegistry[target.id] then activeVfxRegistry[target.id] = {} end
+                            activeVfxRegistry[target.id][spellId] = target
+                        end
+
+                        local vfxOptions = { mwMagicVfx = true } -- Engine-managed one-shot
+                        if isPersistentLoop then
+                            vfxOptions = { 
+                                loop      = true, 
+                                mwMagicVfx = false, 
+                                vfxId     = "MagExp_" .. spellId 
+                            }
+                        end
+
+                        target:sendEvent('AddVfx', {
+                            model = static.model,
+                            options = vfxOptions
+                        })
+
+                        -- [TIMER CLEANUP] AUTHORITATIVE REMOVAL
+                        if isPersistentLoop then
+                            local duration = spell.effects[1].duration or 30
+                            async:newUnsavableSimulationTimer(duration, function()
+                                if target and target:isValid() then
+                                    target:sendEvent('RemoveVfx', "MagExp_" .. spellId)
+                                end
+                            end)
+                        end
+                    end
+                end
+                
+                -- Play school sound
+                local snd = mgef.school:lower() .. " hit"
+                target:sendEvent('PlaySound3d', { sound = snd })
+            end
+        end)
+    end
+
     debugLog(string.format("Applying %s to %s", spellId, target.recordId or target.id))
 
     -- [MOD-SIDE VETO] Allow other mods (like OSSC) to block hits (made to not affect corpses)
     if targetFilter and not targetFilter(target) then
+        print("[MagExp] Target Blocked by Veto Filter: " .. tostring(target.recordId or target.id))
         debugLog("applySpellToActor: Blocked by targetFilter")
         return
     end
@@ -179,41 +291,15 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemRec
         local activeSpells = types.Actor.activeSpells(target)
         if activeSpells then
             local params = {
-                id      = isEnchantment and (itemRecordId or spellId) or spellId,
+                id      = spellId, -- Use the Enchantment/Spell ID so the engine plays persistent visuals (Shield, etc.)
                 effects = effectIndexes,
             }
             if caster and caster:isValid() then params.caster = caster end
-            
-            -- [ENCHANTMENT VISUALS] Manual dispatch because engine activeSpells:add often skips item VFX
-            if isEnchantment and spell.effects then
-                pcall(function()
-                    for _, eff in ipairs(spell.effects) do
-                        local mgef = core.magic.effects.records[eff.id]
-                        if mgef then
-                            -- Visuals
-                            local vfxId = mgef.hitStatic
-                            if vfxId and vfxId ~= "" then
-                                local static = types.Static.records[vfxId]
-                                if static and static.model then
-                                    target:sendEvent('AddVfx', {
-                                        model = static.model,
-                                        options = { mwMagicVfx = true, vfxId = mgef.id }
-                                    })
-                                end
-                            end
-                            -- Sounds
-                            local soundId = mgef.castSound -- fallback to cast sound for individual effect hit if needed
-                            if not soundId or soundId == "" then soundId = mgef.school:lower() .. " cast" end
-                            if soundId and soundId ~= "" then
-                                target:sendEvent('PlaySound3d', { sound = soundId })
-                            end
-                        end
-                    end
-                end)
-            end
 
             -- Apply effects
             if isEnchantment then
+                -- Provide the item source for mods that need it (like OSSC)
+                if itemObject and itemObject:isValid() then params.item = itemObject end
                 pcall(function() activeSpells:add(params) end)
             else
                 local isStackable = false
@@ -225,6 +311,27 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemRec
             end
             local effCount = spell.effects and #spell.effects or 0
             debugLog(string.format("Successfully added %s (%d effect(s))", spellId, effCount))
+
+            -- Handle harmful effects: elicit hostile reaction
+            if hasHarmful and types.NPC.objectIsInstance(target) then
+                print("MagExp: Triggering hostile reaction on " .. target.recordId .. " from " .. (caster.recordId or "unknown"))
+                local attackInfo = {
+                    attacker = caster,
+                    damage = {health = 0},
+                    successful = true,
+                    sourceType = 'Magic',
+                    strength = 1.0,
+                    type = 'Thrust'
+                }
+                local ok, err = pcall(function() target:sendEvent('Hit', attackInfo) end)
+                if not ok then print("MagExp: sendEvent Hit failed: " .. tostring(err)) end
+            end
+
+            -- Handle casterLinked effects: track for removal on caster death
+            if hasCasterLinked then
+                print("MagExp: Tracking casterLinked spell " .. spellId .. " on " .. target.recordId)
+                table.insert(casterLinkedSpells, {caster = caster, target = target, spellId = spellId})
+            end
         end
     end)
     if not ok then debugLog("Spell Application Error: " .. tostring(err)) end
@@ -331,7 +438,7 @@ end
 -- ============================================================
 -- [AOE] Detonate spell at world position
 -- ============================================================
-local function detonateSpellAtPos(spellId, caster, pos, cell, itemRecordId)
+local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject)
     local spell = core.magic.spells.records[spellId] or core.magic.enchantments.records[spellId]
     if not spell or not spell.effects then return end
 
@@ -382,7 +489,7 @@ local function detonateSpellAtPos(spellId, caster, pos, cell, itemRecordId)
                         end
                     else
                         if object.type == types.NPC or object.type == types.Creature or object.type == types.Player then
-                            applySpellToActor(spellId, caster, object, pos, true, itemRecordId)
+                            applySpellToActor(spellId, caster, object, pos, true, itemObject)
                             -- Broadcast AoE hit
                             fireMagicHitEvent({
                                 attacker  = caster,
@@ -535,7 +642,7 @@ end
 local function launchSpell(data)
     local attacker  = data.attacker
     local spellId   = data.spellId
-    local itemRecordId = data.itemRecordId
+    local itemObject = data.item or data.itemObject
     local startPos  = data.startPos
     local direction = data.direction
 
@@ -581,8 +688,8 @@ local function launchSpell(data)
             end
         end)
         local torsoPos = attacker.position + util.vector3(0, 0, zOffset)
-        if area > 0 then detonateSpellAtPos(spellId, attacker, torsoPos, attacker.cell, itemRecordId) end
-        applySpellToActor(spellId, attacker, attacker, torsoPos, false, itemRecordId)
+        if area > 0 then detonateSpellAtPos(spellId, attacker, torsoPos, attacker.cell, itemObject) end
+        applySpellToActor(spellId, attacker, attacker, torsoPos, false, itemObject)
         return
     end
 
@@ -621,45 +728,22 @@ local function launchSpell(data)
                         end
                     end)
                     local torsoPos = obj.position + util.vector3(0, 0, zOffset)
-                    if area > 0 then detonateSpellAtPos(spellId, attacker, torsoPos, attacker.cell, itemRecordId) end
-                    applySpellToActor(spellId, attacker, obj, torsoPos, false, itemRecordId)
+                    if area > 0 then detonateSpellAtPos(spellId, attacker, torsoPos, obj.cell, itemObject) end
+                    applySpellToActor(spellId, attacker, obj, torsoPos, false, itemObject)
+
+                    -- [VFX FOR TOUCH] Manually trigger hit visuals since there is no projectile collision
+                    fireMagicHitEvent({
+                        attacker   = attacker,
+                        target     = obj,
+                        spellId    = spellId,
+                        itemObject = itemObject,
+                        hitPos     = torsoPos,
+                        isAoE      = false,
+                        area       = area,
+                        spellType  = core.magic.RANGE.Touch
+                    })
                 end
                 return
-            end
-        end
-
-        local spellIsLockUnlock = false
-        if spell.effects then
-            for _, eff in ipairs(spell.effects) do
-                if eff.id == "open" or eff.id == "lock" then spellIsLockUnlock = true end
-            end
-        end
-        for _, obj in ipairs(attacker.cell:getAll()) do
-            if obj ~= attacker and obj:isValid() then
-                local validTarget = false
-                if spellIsLockUnlock then
-                    if obj.type == types.Door then validTarget = true end
-                else
-                    if obj.type == types.NPC or obj.type == types.Creature or obj.type == types.Player then validTarget = true end
-                end
-                if validTarget and (obj.position - startPos):length() < 250 then
-                    if spellIsLockUnlock then
-                        handleDoorLockUnlock(spellId, attacker, obj)
-                    else
-                        local zOffset = 95
-                        pcall(function()
-                            local bbox = obj:getBoundingBox()
-                            if bbox and bbox.min and bbox.max then
-                                zOffset = (bbox.max.z - bbox.min.z) * 0.5
-                                if zOffset > 105 then zOffset = 100 end
-                            end
-                        end)
-                        local torsoPos = obj.position + util.vector3(0, 0, zOffset)
-                        if area > 0 then detonateSpellAtPos(spellId, attacker, torsoPos, attacker.cell, itemRecordId) end
-                        applySpellToActor(spellId, attacker, obj, torsoPos, false, itemRecordId)
-                    end
-                    return
-                end
             end
         end
         return
@@ -721,7 +805,7 @@ local function launchSpell(data)
         -- Identity
         attacker    = attacker,
         spellId     = spellId,
-        itemRecordId = itemRecordId,
+        itemRecordId = itemObject and itemObject.recordId or nil,
         area        = area,
         -- Audio
         boltSound   = boltSound,
@@ -807,7 +891,6 @@ local function onProjectileCollision(data)
         attacker   = attacker,
         target     = target,
         spellId    = spellId,
-        itemRecordId = itemRecordId,
         hitPos     = hitPos,
         hitNormal  = data.hitNormal,
         velocity   = data.velocity,
@@ -837,6 +920,66 @@ local function onUpdate(dt)
             lastPlayerCell = currentCell
         end
     end
+
+    -- [PERSISTENT VFX CLEANUP] Pulsed every 0.1s
+    local gameTime = core.getSimulationTime()
+    if not MagExp_NextCleanup or gameTime > MagExp_NextCleanup then
+        MagExp_NextCleanup = gameTime + 0.1
+        for targetId, spells in pairs(activeVfxRegistry) do
+            local anyRemaining = false
+            for spellId, target in pairs(spells) do
+                if not target:isValid() then
+                    spells[spellId] = nil
+                else
+                    local isActive = false
+                    pcall(function()
+                        local as = types.Actor.activeSpells(target)
+                        if as then
+                            for _, inst in pairs(as) do
+                                if inst.id == spellId then
+                                    isActive = true
+                                    break
+                                end
+                            end
+                        end
+                    end)
+                    
+                    if not isActive then
+                        target:sendEvent('RemoveVfx', "MagExp_" .. spellId)
+                        spells[spellId] = nil
+                    else
+                        anyRemaining = true
+                    end
+                end
+            end
+            if not anyRemaining then activeVfxRegistry[targetId] = nil end
+        end
+
+        -- [CASTER LINKED CLEANUP] Remove casterLinked spells if caster dies
+        for i = #casterLinkedSpells, 1, -1 do
+            local link = casterLinkedSpells[i]
+            local caster = link.caster
+            local isCasterDead = false
+            if not caster or not caster:isValid() then
+                isCasterDead = true
+            elseif types.Actor.objectIsInstance(caster) then
+                local health = types.Actor.stats.dynamic.health(caster)
+                if health and health.current <= 0 then
+                    isCasterDead = true
+                end
+            end
+            if isCasterDead then
+                local target = link.target
+                if target and target:isValid() then
+                    pcall(function()
+                        local activeSpells = types.Actor.activeSpells(target)
+                        if activeSpells then activeSpells:remove(link.spellId) end
+                    end)
+                end
+                table.remove(casterLinkedSpells, i)
+            end
+        end
+    end
 end
 
 -- ============================================================
@@ -855,6 +998,12 @@ return {
         --- Apply spell effects directly to an actor.
         -- @param spellId string, caster Actor, target Actor, hitPos vector3
         applySpellToActor = applySpellToActor,
+
+        --- Register an effect ID to use persistent looping visuals (e.g. Shield).
+        -- @param effectId string
+        registerPersistentEffect = function(id)
+            if id then STACK_CONFIG.PERSISTENT_EFFECTS[id:lower()] = true end
+        end,
 
         --- Trigger an AoE blast at a world position.
         -- @param spellId string, caster Actor, pos vector3, cell Cell

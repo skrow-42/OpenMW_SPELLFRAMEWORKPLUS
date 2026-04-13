@@ -1,4 +1,4 @@
-# OpenMW Magicka Expanded v1.2 Framework
+# OpenMW Magicka Expanded v1.3 Framework
 
 **OpenMW's Magicka Expanded** is a standardized spell-launching engine for OpenMW Lua. It kind of dehardcodes the magic system with available methods from the API, providing a unified public interface (`I.MagExp`) for modders to trigger spell casts and effects. Using MaxYari Lua Physics as a hard dependency.
 
@@ -6,7 +6,6 @@
 
 ## 1. Setup for Modders
 To use this framework with your mod:
-
 0. Ensure you have Max Yari Lua Physics enabled.
 1. Ensure `OpenMW_Magicka_Expanded_Framework.omwscripts` is loaded.
 2. Ensure your mod has a dependency or check for the interface.
@@ -40,11 +39,34 @@ I.MagExp.STACK_CONFIG.DEFAULT_LIMIT = 2 -- All spells stack twice by default
 I.MagExp.STACK_CONFIG.SPELL_LIMITS["shield"] = 5 -- Specific spell can stack 5 times
 ```
 
+### `registerPersistentEffect(id)`
+Register a magic effect ID (e.g., "shield" or "soultrap") to use authoritative looping VFX.
+```lua
+I.MagExp.registerPersistentEffect("my_custom_aura")
+```
+
+### `registerHostileEffect(id)`
+Flags a non-damaging effect as a hostile act (provokes combat and bounty).
+```lua
+I.MagExp.registerHostileEffect("soultrap")
+```
+
+### `setTargetFilter(function)`
+Define a global filter to block spells from hitting specific objects (return `false` to veto).
+```lua
+I.MagExp.setTargetFilter(function(target)
+    if target.type == types.NPC and types.Actor.stats.dynamic.health(target).current <= 0 then
+        return false -- Don't hit corpses
+    end
+    return true
+end)
+```
+
 ---
 
 ## 3. The `data` Parameter Table
 All fields except the first four are optional.
-```lua
+
 | Parameter      | Type      | Default  | Description |
 | **attacker**   | `Actor`   | Required | The actor responsible for the spell. |
 | **spellId**    | `string`  | Required | The ID of the spell record to cast. |
@@ -54,14 +76,14 @@ All fields except the first four are optional.
 | **area**       | `number`  | Auto     | Impact radius in game units, use only with AoE spells. |
 | **isFree**     | `boolean` | `false`  | Skip magicka cost check if `true`. |
 | **speed**      | `number`  | `1500`   | Speed of the projectile (units/sec). |
+| **spawnOffset**| `number`  | `80`     | Teleport distance on launch. Use `10` for point-blank accuracy. |
 | **maxLifetime**| `number`  | `10`     | Seconds until projectile is destroyed. |
 | **vfxRecId**   | `string`  | Auto     | The Record ID for the bolt (e.g. `VFX_DestructBolt`). |
 | **boltSound**  | `string`  | Auto     | Looping flight sound ID. |
-| **spinSpeed**  | `number`  | Auto     | Mesh rotation speed (radians per second). |
 | **boltLightId**| `string`  | Auto     | Record ID of the light attached to the bolt. |
-| **itemRecordId**| `string` | `spellId`| Required for Items/Scrolls to handle visuals correctly. |
-| **hitObject**  | `Object`  | `nil`    | Optional priority target (e.g. from SharedRay) for Touch spells. |
-```
+| **itemObject** | `Object`  | `nil`    | Required for Items/Scrolls to handle visuals correctly. |
+| **hitObject**  | `Object`  | `nil`    | Priority target for authoritative hits (ignores physics). |
+
 ---
 
 ## 4. Precision Targeting: `I.SharedRay` (Player)
@@ -104,7 +126,7 @@ core.sendGlobalEvent('MagExp_CastRequest', {
 
 ## 5. Magic Impact Events: `MagExp_OnMagicHit`
 The framework broadcasts a global event whenever a spell (Projectile, Touch, or Self) connects with a target. This allows other mods to react to magic impacts.
-```lua
+
 ### `MagicHitInfo` Data Structure
 | Field         | Type         | Description |
 | :---          | :---         | :--- |
@@ -120,7 +142,7 @@ The framework broadcasts a global event whenever a spell (Projectile, Touch, or 
 | **isAoE**     | `boolean`    | `true` if this hit is part of a splash/area effect. |
 | **stackLimit**| `number`     | Stacking limit for this spell on this target. |
 | **stackCount**| `number`     | Current instances on target after this hit. |
-```
+
 #### Usage Example (Global Script):
 ```lua
 core.events.addHandler('MagExp_OnMagicHit', function(info)
@@ -170,6 +192,17 @@ end
 
 ---
 
-## 6. Internal Logic & Fallbacks
-- **Auto-Detection:** If `vfxRecId`, `boltSound`, or `spinSpeed` are omitted, MagickaExpanded parses the first effect of the spell. It detects the School (Alteration, Destruction, etc.) and Element (Fire, Frost, Poison) to assign appropriate vanilla-accurate visuals and audio.
-- **Safety:** The framework uses `Colony_Assassin_act` (dummy id from the CS) as the invisible carrier object. It is guaranteed to be present in all OpenMW installations.
+---
+
+## 7. Utility Events
+
+### `MagExp_BreakInvisibility`
+Forces an actor to lose all active Invisibility effects.
+```lua
+core.sendGlobalEvent('MagExp_BreakInvisibility', { actor = myPlayer })
+```
+
+## 8. Internal Logic & Fallbacks
+- **Dynamic Spawning:** Providing a `spawnOffset` (e.g. `10`) prevents projectiles from spawning "inside" actors when at point-blank range.
+- **Auto-Detection:** MagExp parses spell records to assign school-accurate visuals and sounds automatically.
+- **Safety:** Uses persistent `Colony_Assassin_act` carrier objects for maximum compatibility.

@@ -4,7 +4,7 @@ if I.Settings and I.Settings.registerPage then
     I.Settings.registerPage({
         key         = 'MagExpPage',
         l10n        = 'MagExp',
-        name        = 'Magicka Expanded v1.0',
+        name        = 'Magicka Expanded v1.3',
         description = 'Framework settings for OMW Magicka Expanded Framework'
     })
 
@@ -26,5 +26,7 @@ if I.Settings and I.Settings.registerPage then
         }
     })
 end
+
+print("MagExp settings script loaded")
 
 return {}
