@@ -1,6 +1,6 @@
-# SPELL API PLUS v1.3 Framework
+# SPELL FRAMEWORK PLUS v1.3 Framework
 
-**SPELL API PLUS** is a standardized spell-launching engine for OpenMW Lua. It kind of dehardcodes the magic system with available methods from the API, providing a unified public interface (`I.MagExp`) for modders to trigger spell casts and effects. Using MaxYari Lua Physics as a hard dependency.
+**SPELL FRAMEWORK PLUS** is a standardized spell-launching engine for OpenMW Lua. It kind of dehardcodes the magic system with available methods from the API, providing a unified public interface (`I.MagExp`) for modders to trigger spell casts and effects. Using MaxYari Lua Physics as a hard dependency.
 
 ---
 
