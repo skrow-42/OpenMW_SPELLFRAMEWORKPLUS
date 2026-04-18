@@ -64,7 +64,7 @@ end)
 
 ---
 
-## 3. The `data` Parameter Table
+## 3. The `data` Parameter Table (for I.MagExp.launchSpell)
 All fields except the first four are optional.
 ```lua
 | Parameter      | Type      | Default  | Description |
