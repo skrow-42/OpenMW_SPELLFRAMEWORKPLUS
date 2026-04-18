@@ -1,13 +1,13 @@
 # SPELL API PLUS v1.3 Framework
 
-**OpenMW's Magicka Expanded** is a standardized spell-launching engine for OpenMW Lua. It kind of dehardcodes the magic system with available methods from the API, providing a unified public interface (`I.MagExp`) for modders to trigger spell casts and effects. Using MaxYari Lua Physics as a hard dependency.
+**SPELL API PLUS** is a standardized spell-launching engine for OpenMW Lua. It kind of dehardcodes the magic system with available methods from the API, providing a unified public interface (`I.MagExp`) for modders to trigger spell casts and effects. Using MaxYari Lua Physics as a hard dependency.
 
 ---
 
 ## 1. Setup for Modders
 To use this framework with your mod:
 0. Ensure you have Max Yari Lua Physics enabled.
-1. Ensure `OpenMW_Magicka_Expanded_Framework.omwscripts` is loaded.
+1. Ensure `SPELL_API_PLUS.omwscripts` is loaded.
 2. Ensure your mod has a dependency or check for the interface.
 
 ---
