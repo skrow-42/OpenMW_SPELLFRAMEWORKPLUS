@@ -252,8 +252,12 @@ core.sendGlobalEvent('MagExp_BreakInvisibility', { actor = myPlayer })
 
 
 
-CREDITS:
+**CREDITS:**
 Credits go to OpenMW dev team for pushing MR with Magic Api methods for creating draft spells which made it possible to do in the first place
+
 Credits to MaxYari for his Lua Physics engine
+
 Credits to hyacinth and ownlyme for SharedRay lib
+
 Credits to all of the users supporting me in the OpenMW Discord
+
