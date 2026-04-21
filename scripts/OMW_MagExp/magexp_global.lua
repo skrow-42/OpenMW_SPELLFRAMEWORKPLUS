@@ -364,7 +364,7 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
             debugLog(string.format("Successfully added %s (%d effect(s))", spellId, effCount))
 
             -- [TRACKING] Register spell for lifecycle events
-            if not trackedEffectRegistry[target.id] then trackedEffectRegistry[target.id] = {} end
+            if not trackedEffectRegistry[target] then trackedEffectRegistry[target] = {} end
             local trackingData = {
                 caster    = caster,
                 startTime = core.getSimulationTime(),
@@ -389,7 +389,7 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
                     end
                 end
             end
-            trackedEffectRegistry[target.id][spellId] = trackingData
+            trackedEffectRegistry[target][spellId] = trackingData
 
             -- Handle harmful effects: elicit hostile reaction
             if hasHarmful and types.NPC.objectIsInstance(target) then
@@ -1138,8 +1138,7 @@ local function onUpdate(dt)
         end
 
         -- [LIFECYCLE TRACKING] onEffectTick & onEffectOver
-        for targetId, spells in pairs(trackedEffectRegistry) do
-            local target = world.getObjectById(targetId)
+        for target, spells in pairs(trackedEffectRegistry) do
             if not target or not target:isValid() or (types.Actor.objectIsInstance(target) and types.Actor.isDead(target)) then
                 -- Actor is gone or dead: Fire onEffectOver for all tracked spells
                 for spellId, data in pairs(spells) do
@@ -1147,7 +1146,7 @@ local function onUpdate(dt)
                         fireEffectEvent('onEffectOver', target, eff)
                     end
                 end
-                trackedEffectRegistry[targetId] = nil
+                trackedEffectRegistry[target] = nil
             else
                 local activeSpells = types.Actor.activeSpells(target)
                 for spellId, data in pairs(spells) do
@@ -1172,7 +1171,7 @@ local function onUpdate(dt)
                     end
                 end
                 -- Clean up empty target entries
-                if next(spells) == nil then trackedEffectRegistry[targetId] = nil end
+                if next(spells) == nil then trackedEffectRegistry[target] = nil end
             end
         end
 

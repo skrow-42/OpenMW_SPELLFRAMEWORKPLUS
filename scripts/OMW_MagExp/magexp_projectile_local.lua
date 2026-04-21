@@ -108,36 +108,6 @@ local function onInit(data)
     end
 end
 
-local function onObjectCollision(other)
-    if not isProjectile or hasCollided or not velocity then return end
-    if other == attacker then return end
-
-    -- [PHYSICAL ACTOR COLLISION]
-    -- User requested non-ray based actor detection. 
-    -- This relies on the engine's collision volume.
-    if other and other:isValid() then
-        if types.Actor.objectIsInstance(other) then
-            if types.Actor.isDead(other) then return end -- Pass through dead bodies
-            
-            hasCollided = true
-            stopSound()
-            core.sendGlobalEvent('MagExp_ProjectileCollision', {
-                projectile  = self,
-                hitObject   = other,
-                hitPos      = self.position,
-                hitNormal   = (self.position - other.position):normalize(),
-                velocity    = velocity,
-                attacker    = attacker,
-                spellId     = spellId,
-                area        = area,
-                effectIndexes = effectIndexes,
-                soundAnchor = soundAnchor,
-                lightAnchor = lightAnchor
-            })
-        end
-    end
-end
-
 local function onUpdate(dt)
     if not isProjectile or hasCollided or not velocity then return end
 
@@ -162,37 +132,52 @@ local function onUpdate(dt)
     end
 
     local from = self.position
-    local to   = from + velocity * dt
+    local moveDist = velocity:length() * dt
+    local to   = from + velocity:normalize() * moveDist
 
-    -- [FIX] Cast the ray 2x further than the per-frame step (lookahead).
-    -- Fast projectiles can skip entirely past thin collision meshes in one frame;
-    -- the extended ray catches those targets. The projectile still moves to `to`,
-    -- not the end of the lookahead, so there is no visual teleport.
-    local lookAheadEnd = from + velocity * dt * 2.0
-    local hit = nearby.castRay(from, lookAheadEnd, { ignore = { self, attacker } })
-    if hit.hit then
-        -- [DEAD ACTOR PASS-THROUGH] Skip corpses — physics mesh stays active during death animation
-        if hit.hitObject and hit.hitObject:isValid() and types.Actor.objectIsInstance(hit.hitObject) then
-            if types.Actor.isDead(hit.hitObject) then
-                -- Treat as a miss: just move the projectile forward
-                core.sendGlobalEvent('MagExp_ProjectileMove', {
-                    projectile  = self,
-                    newPos      = to,
-                    newRot      = currentRotation,
-                    soundAnchor = soundAnchor,
-                    lightAnchor = lightAnchor
-                })
-                return
+    -- [PHYSICAL VOLUME SIMULATION]
+    -- Since native collision events are unsupported, we use a 4-point cross pattern 
+    -- of raycasts to simulate a projectile with a radius of ~12 units.
+    local dir   = velocity:normalize()
+    local right = util.vector3(dir.y, -dir.x, 0):normalize()
+    if right:length() < 0.01 then right = util.vector3(1, 0, 0) end
+    local up    = dir:cross(right):normalize()
+    
+    local radius = 12
+    local offsets = {
+        util.vector3(0,0,0), -- Center
+        right * radius,
+        -right * radius,
+        up * radius,
+        -up * radius
+    }
+
+    local lookAheadDist = moveDist * 2.0
+    local ray = nil
+
+    for _, offset in ipairs(offsets) do
+        local startPos = from + offset
+        local endPos   = startPos + dir * lookAheadDist
+        local hit = nearby.castRay(startPos, endPos, { ignore = { self, attacker } })
+        if hit.hit then
+            -- [DEAD ACTOR PASS-THROUGH] Skip corpses
+            local hitObj = hit.hitObject
+            if hitObj and hitObj:isValid() and types.Actor.objectIsInstance(hitObj) and types.Actor.isDead(hitObj) then
+                -- Skip this hit and try others or just pass through
+            else
+                ray = hit; break
             end
         end
+    end
 
+    if ray then
         hasCollided = true
         stopSound()
         core.sendGlobalEvent('MagExp_ProjectileCollision', {
             projectile  = self,
-            hitObject   = hit.hitObject,
-            hitPos      = hit.hitPos,
-            hitNormal   = hit.hitNormal,
+            hitObject   = ray.hitObject,
+            hitPos      = ray.hitPos,
+            hitNormal   = ray.hitNormal,
             velocity    = velocity,
             attacker    = attacker,
             spellId     = spellId,
@@ -216,7 +201,6 @@ end
 return {
     engineHandlers = {
         onUpdate = onUpdate,
-        onObjectCollision = onObjectCollision,
     },
     eventHandlers = {
         MagExp_InitProjectile  = onInit,
