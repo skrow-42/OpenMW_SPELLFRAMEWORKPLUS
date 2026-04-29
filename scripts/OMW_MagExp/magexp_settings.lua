@@ -5,8 +5,8 @@ if I.Settings and I.Settings.registerPage then
         I.Settings.registerPage({
             key         = 'MagExpPage',
             l10n        = 'MagExp',
-            name        = 'Magicka Expanded v1.6',
-            description = 'Framework settings for OMW Magicka Expanded Framework'
+            name        = 'Spell Framework Plus 1.7',
+            description = 'Framework settings for OMW Spell Framework Plus'
         })
     end)
 
