@@ -285,7 +285,7 @@ end
 -- ============================================================
 -- [CORE] Authoritative Spell Application
 -- ============================================================
-local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObject, forcedEffects, unreflectable, casterLinked, userData, muteAudio, muteLight)
+local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObject, forcedEffects, unreflectable, casterLinked, userData, muteAudio, muteLight, continuousVfx)
     if not target or not target:isValid() then return end
     if not (caster and caster:isValid()) then caster = target end
     if target.type ~= types.NPC and target.type ~= types.Creature and target.type ~= types.Player then
@@ -532,7 +532,7 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
 
             -- [FEATURE 3] continuousVfx: register persistent cast VFX on the target.
             -- The VFX is tracked in activeVfxRegistry and cleaned up when the spell expires.
-            if data and data.continuousVfx then
+            if continuousVfx then
                 if not activeVfxRegistry[target.id] then activeVfxRegistry[target.id] = {} end
                 activeVfxRegistry[target.id][spellId] = target
                 -- Spawn the cast glow VFX model attached to the target
@@ -726,7 +726,7 @@ end
 -- ============================================================
 -- [AOE] Detonate spell at world position
 -- ============================================================
-local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject, forcedEffects, unreflectable, casterLinked, vfxOverride, impactSpeed, maxSpeed, areaVfxScale, excludeTarget, userData, muteAudio, muteLight)
+local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject, forcedEffects, unreflectable, casterLinked, vfxOverride, impactSpeed, maxSpeed, areaVfxScale, excludeTarget, userData, muteAudio, muteLight, continuousVfx)
     local spell = core.magic.spells.records[spellId] or core.magic.enchantments.records[spellId]
     if not spell and spellId then
         -- Safe iterative fallback for numerical proxies or case-sensitivity edge cases
@@ -874,7 +874,7 @@ local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject, forced
                         handleDoorLockUnlock(spellId, caster, object)
                         affectedCount = affectedCount + 1
                     elseif isActor and not isLockUnlock and not (types.Actor.objectIsInstance(object) and types.Actor.isDead(object)) then
-                        applySpellToActor(spellId, caster, object, pos, true, itemObject, forcedEffects, unreflectable, casterLinked, userData, muteAudio, muteLight)
+                        applySpellToActor(spellId, caster, object, pos, true, itemObject, forcedEffects, unreflectable, casterLinked, userData, muteAudio, muteLight, continuousVfx)
                         -- Broadcast AoE hit
                         fireMagicHitEvent({
                             attacker  = caster,
@@ -1193,12 +1193,67 @@ local function launchSpell(data)
         end
     end
 
-    -- Optional magicka guard (skipped when isFree = true)
+    -- [RESOURCE GUARD] (skipped when isFree = true)
     if not data.isFree then
-        local magicka = (attacker.type == types.Player)
-            and types.Player.stats.dynamic.magicka(attacker)
-            or  types.Actor.stats.dynamic.magicka(attacker)
-        if magicka.current < (spell.cost or 0) then return end
+        local cost = spell.cost or 0
+        local isEnchantment = core.magic.enchantments.records[spellId] ~= nil
+        
+        if isEnchantment and itemObject and type(itemObject) ~= "string" and itemObject:isValid() then
+            if spell.type == core.magic.ENCHANTMENT_TYPE.CastOnce then
+                -- Scroll / Cast Once Check: Consume 1 item
+                if itemObject.count > 0 then
+                    if attacker.type == types.Player then
+                        attacker:sendEvent('MagExp_ConsumeResource', { itemCountCost = 1, itemRecordId = itemObject.recordId })
+                    end
+                else
+                    if attacker.type == types.Player then
+                        attacker:sendEvent('Ui_ShowMessage', "You do not have enough of that item.")
+                    end
+                    return
+                end
+            else
+                -- Enchantment Charge Check: Scale cost based on Enchant skill
+                local skill = 0
+                pcall(function()
+                    if attacker.type == types.Player then
+                        skill = types.Player.stats.skills.enchant(attacker).modified
+                    elseif attacker.type == types.NPC then
+                        skill = types.NPC.stats.skills.enchant(attacker).modified
+                    end
+                end)
+                cost = math.max(1, math.floor(0.01 * (110 - skill) * cost))
+                
+                local currentCharge = types.Item.enchantmentCharge(itemObject) or 0
+                if currentCharge < cost then
+                    if attacker.type == types.Player then
+                        attacker:sendEvent('Ui_ShowMessage', "You don't have enough charges in this item")
+                    end
+                    debugLog("Enchantment failure: " .. spellId .. " requires " .. cost .. " charges, has " .. currentCharge)
+                    return
+                end
+                -- [DEDUCTION]
+                if attacker.type == types.Player then
+                    attacker:sendEvent('MagExp_ConsumeResource', { itemChargeCost = cost, itemRecordId = itemObject.recordId })
+                end
+            end
+        else
+            -- Magicka Check
+            local magicka = (attacker.type == types.Player)
+                and types.Player.stats.dynamic.magicka(attacker)
+                or  types.Actor.stats.dynamic.magicka(attacker)
+            
+            if magicka.current < cost then
+                if attacker.type == types.Player then
+                    attacker:sendEvent('Ui_ShowMessage', "You don't have enough magicka")
+                end
+                debugLog("Magicka failure: " .. spellId .. " requires " .. cost .. " magicka, has " .. magicka.current)
+                return
+            end
+            -- [DEDUCTION]
+            if attacker.type == types.Player then
+                attacker:sendEvent('MagExp_ConsumeResource', { magickaCost = cost })
+            end
+        end
     end
     
     -- [ITEM REQUIREMENTS]
@@ -1280,7 +1335,7 @@ local function launchSpell(data)
     -- If there are Self effects and we are doing a non-Self routing, apply Self parts to attacker now.
     if #selfIndexes > 0 and routingType ~= core.magic.RANGE.Self then
         debugLog(string.format("Splitting %d Self effects from %s", #selfIndexes, spellId))
-        applySpellToActor(spellId, attacker, attacker, nil, false, itemObject, selfIndexes, data.unreflectable, data.casterLinked, data.userData)
+        applySpellToActor(spellId, attacker, attacker, nil, false, itemObject, selfIndexes, data.unreflectable, data.casterLinked, data.userData, data.muteAudio, data.muteLight, data.continuousVfx)
         
         -- If no non-Self effects remain, we're done.
         if #otherIndexes == 0 then return end
@@ -1300,8 +1355,9 @@ local function launchSpell(data)
             end
         end)
         local torsoPos = attacker.position + util.vector3(0, 0, zOffset)
-        if area > 0 then detonateSpellAtPos(spellId, attacker, torsoPos, attacker.cell, itemObject, effectIndexes, data.unreflectable, data.casterLinked, nil, 0, 0, 1, nil, data.userData) end
-        applySpellToActor(spellId, attacker, attacker, torsoPos, false, itemObject, effectIndexes, data.unreflectable, data.casterLinked, data.userData)
+        debugLog("Self routing hit-pos: " .. tostring(torsoPos))
+        if area > 0 then detonateSpellAtPos(spellId, attacker, torsoPos, attacker.cell, itemObject, effectIndexes, data.unreflectable, data.casterLinked, nil, 0, 0, 1, nil, data.userData, data.muteAudio, data.muteLight, data.continuousVfx) end
+        applySpellToActor(spellId, attacker, attacker, torsoPos, false, itemObject, effectIndexes, data.unreflectable, data.casterLinked, data.userData, data.muteAudio, data.muteLight, data.continuousVfx)
         return
     end
 
@@ -1479,6 +1535,9 @@ local function launchSpell(data)
         direction     = dir,   -- [FIX] Always pass direction even if velocity is 0
         areaVfxScale  = data.areaVfxScale,
         userData      = data.userData,
+        muteAudio     = data.muteAudio,
+        muteLight     = data.muteLight,
+        continuousVfx = data.continuousVfx,
     }
     if proj and proj:isValid() then
         proj:sendEvent('MagExp_InitProjectile', initPayload)
@@ -1494,7 +1553,8 @@ local function launchSpell(data)
             maxSpeed   = data.maxSpeed or 0,
             userData   = data.userData,
             muteAudio  = data.muteAudio,
-            muteLight  = data.muteLight
+            muteLight  = data.muteLight,
+            continuousVfx = data.continuousVfx
         }
     end
 
@@ -1578,7 +1638,7 @@ local function onProjectileCollision(data)
     local effectIndexes = data.effectIndexes
     -- [ORDER: Detonation First]
     if area > 0 then
-        detonateSpellAtPos(spellId, attacker, hitPos, cell, itemRecordId, effectIndexes, data.unreflectable, data.casterLinked, data.areaVfxRecId or data.vfxRecId, impactSpeed, refMaxSpeed, data.areaVfxScale, target, userData, muteAudio, muteLight)
+        detonateSpellAtPos(spellId, attacker, hitPos, cell, itemRecordId, effectIndexes, data.unreflectable, data.casterLinked, data.areaVfxRecId or data.vfxRecId, impactSpeed, refMaxSpeed, data.areaVfxScale, target, userData, muteAudio, muteLight, data.continuousVfx)
     end
 
     -- [ORDER: Interaction / Direct Hit Second]
@@ -1588,7 +1648,7 @@ local function onProjectileCollision(data)
     if spellIsLockUnlock and isLockable then
         handleDoorLockUnlock(spellId, attacker, target)
     elseif isActor and not (types.Actor.objectIsInstance(target) and types.Actor.isDead(target)) then
-        applySpellToActor(spellId, attacker, target, hitPos, false, itemRecordId, effectIndexes, data.unreflectable, data.casterLinked, userData, muteAudio, muteLight)
+        applySpellToActor(spellId, attacker, target, hitPos, false, itemRecordId, effectIndexes, data.unreflectable, data.casterLinked, userData, muteAudio, muteLight, data.continuousVfx)
     end
 
     -- [MAXYARI] Physics impulse on detonation
@@ -1766,7 +1826,7 @@ local MagExpPublicInterface = {
     launchSpell = launchSpell,
 
     --- Apply spell effects directly to an actor.
-    -- @param spellId string, caster Actor, target Actor, hitPos vector3, isAoe boolean, itemObject Object, forcedEffects table, unreflectable boolean, casterLinked boolean
+    -- @param spellId string, caster Actor, target Actor, hitPos vector3, isAoe boolean, itemObject Object, forcedEffects table, unreflectable boolean, casterLinked boolean, userData table, muteAudio boolean, muteLight boolean, continuousVfx boolean
     applySpellToActor = applySpellToActor,
 
     --- Helper: Emit a spell projectile directly from a non-actor object (like a door, trap, activator, or script).
@@ -1780,7 +1840,7 @@ local MagExpPublicInterface = {
             if not pos then pos = data.source.position end
         end
 
-        launchSpell({
+        return launchSpell({
             attacker  = data.source, -- Sent as custom source (sanitized safely by engine logic)
             spellId   = data.spellId,
             startPos  = pos,
@@ -1823,7 +1883,7 @@ local MagExpPublicInterface = {
     end,
 
     --- Trigger an AoE blast at a world position.
-    -- @param spellId string, caster Actor, pos vector3, cell Cell, itemObject Object, forcedEffects table, unreflectable boolean, casterLinked boolean
+    -- @param spellId string, caster Actor, pos vector3, cell Cell, itemObject Object, forcedEffects table, unreflectable boolean, casterLinked boolean, vfxOverride string, impactSpeed number, maxSpeed number, areaVfxScale number, excludeTarget Object, userData table, muteAudio boolean, muteLight boolean, continuousVfx boolean
     detonateSpellAtPos = detonateSpellAtPos,
 
     --- Register a custom target filter. Returns true/false to allow/block hits.

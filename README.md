@@ -1,4 +1,4 @@
-# SPELL FRAMEWORK PLUS (MagExp) v1.7
+# SPELL FRAMEWORK PLUS (MagExp) v1.7a
 
 **SPELL FRAMEWORK PLUS** is a standardized spell-launching engine for OpenMW Lua. It dehardcodes the magic system and provides a unified public interface (`I.MagExp`) for modders to trigger spell casts, control projectiles in flight, and hook into lifecycle events.
 
@@ -23,14 +23,14 @@ Call these from any **Global Script** using `local I = require('openmw.interface
 
 | Function | Description |
 |:--|:--|
-| `launchSpell(data)` | Launch a spell. Auto-detects routing (Self/Touch/Target). Returns the projectile object. |
-| `emitProjectileFromObject(data)` | Emit a projectile spell directly from a non-actor Static/Door/Activator `data.source` without causing engine crashes. |
-| `applySpellToActor(...)` | Directly apply a spell to an actor. (Ordered arguments, see signature below). |
-| `detonateSpellAtPos(...)` | Trigger an AoE blast at a world position. (Ordered arguments, see signature below). |
+| `launchSpell(data)` | Launch a spell. Returns the projectile object. |
+| `emitProjectileFromObject(data)` | Emit from a non-actor. Returns the projectile object. |
+| `applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObject, forcedEffects, unreflectable, casterLinked, userData, muteAudio, muteLight, continuousVfx)` | Apply directly to actor. |
+| `detonateSpellAtPos(spellId, caster, pos, cell, item, forcedEffects, unreflectable, casterLinked, vfxOverride, impactSpeed, maxSpeed, areaVfxScale, excludeTarget, userData, muteAudio, muteLight, continuousVfx)` | Trigger AoE blast. |
 | `addTargetFilter(fn)` | Register a global filter `fn(target) → bool` to veto hits. |
 | `registerLockableEffect(id)` | Register an effect ID to allow spells to interact with doors and containers. |
 | `registerUniversalEffect(id)`| Register an effect ID to allow Touch spells to interact with ANY game object (Statics, Activators, etc.) and emit a `MagExp_OnMagicHit` hook for it. |
-| **Engine Safety** | All internal VFX and sound dispatchers include `target.enabled` guards to prevent "Can't use a disabled object" errors during high-intensity combat or unsummoning. |
+| **Engine Safety** All internal VFX and sound dispatchers include `target.enabled` guards to prevent "Can't use a disabled object" errors during high-intensity combat or unsummoning. |
 | `STACK_CONFIG` | Table controlling spell stacking limits. |
 
 #### Advanced Application Parameters
@@ -107,13 +107,14 @@ All fields except the first four are optional.
 
 | Parameter | Type | Default | Description |
 |:--- |:--- |:--- |:--- |
-| **Identity & Source** | | | |
+| **Identity & Source** |
 | **attacker** | `Actor` | Required | The casting actor. |
 | **spellId** | `string` | Required | Spell record ID. |
 | **itemObject** | `Object` | `nil` | Source item (for enchantment logic). |
 | **casterLinked** | `boolean` | `false` | If true, hostile reactions are attributed to the `attacker`. |
 | **userData** | `table` | `nil` | Custom per-launch cookie. Returned in all events. |
-| **Movement & Lifecycle** | | | |
+| |
+| **Movement & Lifecycle** |
 | **startPos** | `Vector3` | Required | World position where the spell spawns. |
 | **direction** | `Vector3` | Required | Initial flight direction. |
 | **speed** | `number` | `1500` | Initial speed (units/sec). |
@@ -124,13 +125,15 @@ All fields except the first four are optional.
 | **maxLifetime** | `number` | `10` | Seconds before expiry. |
 | **spawnOffset** | `number` | `80` | Distance ahead of `startPos` to spawn. |
 | **isPaused** | `boolean` | `false` | Spawn frozen in place. |
-| **Collision & Bouncing** | | | |
+| |
+| **Collision & Bouncing** |
 | **bounceEnabled** | `boolean` | `false` | Reflect off static geometry. |
 | **bounceMax** | `number` | `0` | Max bounces (0 = unlimited). |
 | **bouncePower** | `number` | `0.7` | Restitution coefficient (0-1). |
 | **detonateOnActorHit** | `boolean` | `true` | If false, actors are treated as static for bounce. |
 | **impactImpulse** | `number` | `0` | MaxYari LuaPhysics knockback magnitude. |
-| **Audiovisual** | | | |
+| |
+| **Audiovisual** |
 | **vfxRecId** | `string` | Auto | Bolt VFX record ID (auto-detected). |
 | **boltModel** | `string` | Auto | Bolt mesh path override. |
 | **areaVfxRecId** | `string` | Auto | Override area explosion static VFX. |
@@ -142,7 +145,8 @@ All fields except the first four are optional.
 | **muteLight** | `boolean` | `false` | Skips environmental lighting on bolt. |
 | **muteCastGlow** | `boolean` | `false` | Skips cast glow VFX on attacker. |
 | **continuousVfx** | `boolean` | `false` | Cast VFX follows target until expiry. |
-| **Logic & Constraints** | | | |
+| |
+| **Logic & Constraints** |
 | **spellType** | `number` | Auto | Routing: Self/Touch/Target. |
 | **area** | `number` | Auto | AoE radius in game units. |
 | **isFree** | `boolean` | `false` | Skip magicka cost check. |
@@ -188,7 +192,7 @@ These fields can be passed as a table to mutate a live projectile.
 
 | Field | Type | Description |
 |:--- |:--- |:--- |
-| **Movement** | | |
+| **Movement** |
 | `velocity` | `Vector3` | Full velocity override. |
 | `speed` | `number` | Speed override (direction unchanged). |
 | `direction` | `Vector3` | Direction redirect (speed unchanged). |
@@ -196,14 +200,16 @@ These fields can be passed as a table to mutate a live projectile.
 | `forceVec` | `Vector3` | New continuous force vector. |
 | `maxSpeed` | `number` | New terminal velocity cap. |
 | `isPaused` | `boolean` | Pause or unpause. |
-| **Collision & Lifecycle** | | |
+| |
+| **Collision & Lifecycle** |
 | `bounceEnabled` | `boolean` | Enable/disable bouncing. |
 | `bounceMax` | `number` | Max bounce count. |
 | `bouncePower` | `number` | Restitution. |
 | `detonateOnActorHit` | `boolean` | Actor-detonation toggle. |
 | `maxLifetime` | `number` | Override max lifetime. |
 | `impactImpulse` | `number` | Override physics knockback. |
-| **Identity & Visuals** | | |
+| |
+| **Identity & Visuals** |
 | `spellId` | `string` | Override what is applied on impact. |
 | `area` | `number` | Override area radius. |
 | `vfxRecId` | `string` | Override bolt VFX. |
@@ -376,16 +382,18 @@ Broadcasted globally on every spell impact (projectile, touch, self).
 
 | Field | Type | Description |
 |:--- |:--- |:--- |
-| **Primary Entities** | | |
+| **Primary Entities** |
 | `attacker` | `GameObject` | The casting actor. |
 | `target` | `GameObject` | The hit object. |
-| **Spatial & Physics** | | |
+| |
+| **Spatial & Physics** |
 | `hitPos` | `Vector3` | Impact world position. |
 | `hitNormal` | `Vector3` | Surface normal at impact. |
 | `impactSpeed` | `number` | Speed (units/sec) at collision. |
 | `maxSpeed` | `number` | Speed cap from launch parameters. |
 | `velocity` | `Vector3` | Final velocity vector at impact. |
-| **Record Metadata** | | |
+| |
+| **Record Metadata** |
 | `spellId` | `string` | Spell record ID. |
 | `school` | `string` | Magic school (e.g. `"alteration"`). |
 | `element` | `string` | `fire`, `frost`, `shock`, `poison`, `heal`, or `default`. |
@@ -393,7 +401,8 @@ Broadcasted globally on every spell impact (projectile, touch, self).
 | `magMin` | `number` | Aggregated minimum magnitude. |
 | `magMax` | `number` | Aggregated maximum magnitude. |
 | `spellType` | `number` | 0=Self, 1=Touch, 2=Target. |
-| **Context & Status** | | |
+| |
+| **Context & Status** |
 | `isAoE` | `boolean` | True if part of an area blast. |
 | `area` | `number` | AoE radius (if applicable). |
 | `unreflectable` | `boolean` | Cannot be reflected. |
@@ -651,14 +660,11 @@ I.MagExp.launchSpell({
         radius = 300,
         isFire = false
     }),
-    -- Suppress the cast glow on the caster if needed
-    muteCastGlow = true,
 })
 ```
 
 | Parameter | Type | Default | Description |
 |:--|:--|:--|:--|
-| `muteCastGlow` | `boolean` | `false` | If true, skips spawning the cast glow VFX on the attacker. |
 | `boltLightId` | `string\|table` | Auto (from `mgef.color`) | Explicit light override. Overrides auto-derived color light. |
 
 ---
@@ -841,7 +847,7 @@ MagExp's player script polls this key every frame. When it detects the key relea
 
 
 ### Credits
-Credits go to OpenMW dev team for pushing MR with Magic Api methods for creating draft spells which made it possible to do in the first place
+Credits go to OpenMW dev team for pushing MR with Magic Api methods for creating draft spells which made it possible to do in the first place (and also for the docs)
 
 Credits to MaxYari for his Lua Physics engine
 

@@ -82,7 +82,7 @@ local function onTextKey(groupname, key)
     if not hasQueuedLaunch then return end
 
     local k = tostring(key):lower()
-    if k == "release" or k == "spellcast" then
+    if k == "release" then
         debugLog("Animation Release Key Detected: " .. k)
         for spellId, item in pairs(pendingLaunches) do
             local spell = core.magic.spells.records[spellId] or core.magic.enchantments.records[spellId]
@@ -174,7 +174,7 @@ if I.AnimationController then
     I.AnimationController.addTextKeyHandler('', onTextKey)
 end
 
-return {
+local handlers = {
     engineHandlers = {
         onUpdate  = onUpdate,
     },
@@ -190,9 +190,9 @@ return {
             local priority = data.priority  or 7
 
             debugLog("MagExp_PlaySpellAnim: " .. group .. " (priority=" .. priority .. " mask=" .. mask .. ")")
-            pcall(function()
+ 
                 anim.play(self, group, priority, mask, false, 1.0)
-            end)
+            
 
             if data.isCharged then
                 -- Register charge hold state; onUpdate will poll the key each frame
@@ -225,10 +225,105 @@ return {
 
         -- VFX Utilities
         AddVfx = function(data)
-            pcall(function() anim.addVfx(self, data.model, data.options) end)
+            anim.addVfx(self, data.model, data.options) end
         end,
         RemoveVfx = function(vfxId)
-            pcall(function() anim.removeVfx(self, vfxId) end)
+            anim.removeVfx(self, vfxId) end
+        end,
+        
+        -- UI Utilities
+        Ui_ShowMessage = function(msg)
+            if type(msg) == "string" then ui.showMessage(msg) end
+        end,
+
+        -- Resource Consumption (Requires Local Script Context)
+        MagExp_ConsumeResource = function(data)
+            pcall(function()
+                if data.magickaCost then
+                    local magicka = types.Actor.stats.dynamic.magicka(self)
+                    magicka.current = math.max(0, magicka.current - data.magickaCost)
+                end
+                if data.itemCountCost and data.itemRecordId then
+                    local inv = types.Actor.inventory(self)
+                    local item = inv:find(data.itemRecordId)
+                    if item then item:remove(data.itemCountCost) end
+                end
+                if data.itemChargeCost and data.itemRecordId then
+                    local inv = types.Actor.inventory(self)
+                    local item = inv:find(data.itemRecordId)
+                    if item then
+                        local itemData = types.Item.itemData(item)
+                        if itemData then
+                            local oldCharge = itemData.enchantmentCharge or 0
+                            itemData.enchantmentCharge = math.max(0, oldCharge - data.itemChargeCost)
+                        end
+                    end
+                end
+            end)
         end,
     }
+}
+
+-- ============================================================
+-- [PUBLIC LOCAL API] For other player scripts (like OSSC, Kinetic Forces)
+-- Exported as I.MagExp_Player via `interfaceName = "MagExp_Player"` in the return block.
+-- ============================================================
+local MagExp_PlayerInterface = {
+    consumeSpellCost = function(spellId, itemObject)
+        if debug.isGodMode() then return true end
+        local spell = core.magic.spells.records[spellId]
+        local isEnchantment = false
+        if not spell then
+            spell = core.magic.enchantments.records[spellId]
+            isEnchantment = spell ~= nil
+        end
+        if not spell then return true end -- Unknown spell — treat as free
+        local cost = spell.cost or 0
+        if cost <= 0 then return true end -- Zero-cost spells always succeed
+
+        if isEnchantment and itemObject and type(itemObject) ~= "string" and itemObject:isValid() then
+            if spell.type == core.magic.ENCHANTMENT_TYPE.CastOnce then
+                if itemObject.count > 0 then
+                    local inv = types.Actor.inventory(self)
+                    if inv then
+                        local foundItem = inv:find(itemObject.recordId)
+                        if foundItem then foundItem:remove(1) end
+                    end
+                    return true
+                else
+                    ui.showMessage("You do not have enough of that item.")
+                    return false
+                end
+            else
+                local skill = 0
+                pcall(function() skill = types.Player.stats.skills.enchant(self).modified end)
+                cost = math.max(1, math.floor(0.01 * (110 - skill) * cost))
+                local itemData = types.Item.itemData(itemObject)
+                local currentCharge = itemData and itemData.enchantmentCharge or spell.charge or 0
+                if currentCharge >= cost then
+                    if itemData then itemData.enchantmentCharge = currentCharge - cost end
+                    return true
+                else
+                    ui.showMessage("You don't have enough charges in this item.")
+                    return false
+                end
+            end
+        else
+            local magicka = types.Actor.stats.dynamic.magicka(self)
+            if magicka.current >= cost then
+                magicka.current = magicka.current - cost
+                return true
+            else
+                ui.showMessage("You do not have enough Magicka to cast the spell.")
+                return false
+            end
+        end
+    end
+}
+
+return {
+    interfaceName = "MagExp_Player",
+    interface     = MagExp_PlayerInterface,
+    engineHandlers = handlers.engineHandlers,
+    eventHandlers  = handlers.eventHandlers,
 }
