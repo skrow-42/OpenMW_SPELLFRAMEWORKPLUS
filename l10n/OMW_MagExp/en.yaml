@@ -1,4 +1,4 @@
-SettingsPageTitle: Spell Framework Plus 1.82
+SettingsPageTitle: Spell Framework Plus 3.15
 SettingsPageDescription: Framework settings for OMW Spell Framework Plus
 
 SettingsGeneralTitle: General
@@ -8,3 +8,11 @@ SettingsDebugModeDescription: Enable to see framework logs in the console (F10).
 
 MSG_INSUFFICIENT_ITEMS: You do not have enough of that item.
 MSG_ITEM_REQUIRED: You need %s to cast %s
+
+# Skill Progression Mode select labels
+magexp: "MagExp (internal formula)"
+ncg: "NCG (Natural Character Growth)"
+skillevo: "Skill Evolution"
+sus: "SUS (Skill Uses Scaled)"
+mbsp: "MBSP"
+none: "None (another mod handles progression)"

@@ -1,6 +1,17 @@
-# SPELL FRAMEWORK PLUS (MagExp) v2.0
+# SPELL FRAMEWORK PLUS (MagExp) — OSSC bundle
 
 **SPELL FRAMEWORK PLUS** is a standardized spell-launching engine for OpenMW Lua. It dehardcodes the magic system and provides a unified public interface (`I.MagExp`) for modders to trigger spell casts, control projectiles in flight, and hook into lifecycle events.
+
+> [!NOTE]
+> **This is the copy bundled in `OSSC/SPELLFRAMEWORKPLUS/`** — the SFP 3.14
+> base **plus the OSSC-side changes 26–33** (world-pause-safe launching and
+> cast queueing, the OpenMW 0.51 player AoE damage fix, caller-scoped target
+> exclusions, creation-ownership cleanup, the curved `motionPath`
+> projectile system, and scroll-cast support under the effect penalty). OSSC
+> ships only this copy and is tested against it; do not install a separate or
+> older Spell Framework Plus over it. The bundle changes are documented in
+> [§27 Side Changelog (26–33)](#27-side-changelog-2633)
+> and live in detail in `../side-slowchu-sfp-changes/changes.txt`.
 
 ---
 
@@ -25,8 +36,8 @@ Call these from any **Global Script** using `local I = require('openmw.interface
 |:--|:--|
 | `launchSpell(data)` | Launch a spell. Returns the projectile object. |
 | `emitProjectileFromObject(data)` | Emit from a non-actor. Returns the projectile object. |
-| `applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObject, forcedEffects, unreflectable, casterLinked, userData, muteAudio, muteLight, continuousVfx)` | Apply directly to actor. |
-| `detonateSpellAtPos(spellId, caster, pos, cell, item, forcedEffects, unreflectable, casterLinked, vfxOverride, impactSpeed, maxSpeed, areaVfxScale, excludeTarget, userData, muteAudio, muteLight, continuousVfx)` | Trigger AoE blast. |
+| `applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObject, forcedEffects, unreflectable, casterLinked, userData, muteAudio, muteLight, continuousVfx, effectScale, sourceData)` | Apply directly to actor. `effectScale` is the quick-cast penalty to apply the spell with (optional, default no penalty). A penalised cast also reduces what the engine spawns for it: a summoned creature arrives with its health / magicka / fatigue / attributes / skills and equipped weapon and armor scaled and replaced, and a bound item is swapped for a reduced copy the moment it equips — damage and armor values, and the enchantment a bound item carries (its own reduced enchantment record), all cut by the penalty (the replacement is removed again when the spell ends, and while it lasts the replacement cannot be dropped out of the caster's inventory — a drop attempt lands back in the pack on the next frame, with a player notice). The enchantment reduction needs the runtime enchantment record API of OpenMW 0.51+; on older engines the twin keeps the template's enchantment and the log says so once. The swap itself is applied by the actor's own local script, because `types.Actor.setEquipment` is a self-only binding: the global sweep generates the reduced record, moves the instance into the actor's inventory and sends `MagExp_EquipReducedItem`, and only removes the full-strength original once the actor confirms with `MagExp_EquipReducedItemApplied`. Stat writes are a self-only binding in OpenMW (`AttributeStat.base`, `DynamicStat.base`/`.current`, `SkillStat.base` may only be written by a local script running on that actor), so a summon's stats are scaled by `magexp_actor_stats.lua` attached to it with `addScript(path, initData)`; the sweep keeps asking until the actor confirms with `MagExp_StatScaleApplied`. |
+| `detonateSpellAtPos(spellId, caster, pos, cell, item, forcedEffects, unreflectable, casterLinked, vfxOverride, impactSpeed, maxSpeed, areaVfxScale, excludeTarget, userData, muteAudio, muteLight, continuousVfx, effectScale, areaOverride)` | Trigger AoE blast. `effectScale` is the quick-cast penalty the cast was reduced with (optional, default no penalty); `areaOverride` is an already-resolved AoE area in feet (optional). Without an override the blast resolves the area from the record and scales it by `effectScale`, so a penalised blast is never wider than its reduced effects. |
 | `addTargetFilter(fn)` | Register a global filter `fn(target) → bool` to veto hits. |
 | `registerLockableEffect(id)` | Register an effect ID to allow spells to interact with doors and containers. |
 | `registerUniversalEffect(id)`| Register an effect ID to allow Touch spells to interact with ANY game object (Statics, Activators, etc.) and emit a `MagExp_OnMagicHit` hook for it. |
@@ -69,6 +80,36 @@ Note: In the code, these indices are 0-based (matching the OpenMW engine's inter
 | `setSpellDetonateOnActor(projId, bool)` | Toggle whether actor contact detonates a bouncing spell. |
 | `setSpellPiercing(projId, enabled, newLimit)` | Toggle piercing and/or change the pierce cap on a live spell. |
 | `getActiveSpellIds()` | Returns a table of all live spell projectile IDs. |
+| `getNormaliseRaceSpeed()` | Returns the SFP "normalise race speed" setting (mirrors the launcher setting of the same name). |
+| `setNormaliseRaceSpeed(enabled)` | Set the "normalise race speed" behaviour at runtime and persist it to `SettingsMagExp_General.NormaliseRaceSpeed`. |
+
+### Projectile Speed Parity
+
+SFP's projectile speed mirrors OpenMW's magic-bolt pipeline:
+
+```
+speed = fTargetSpellMaxSpeed × average(effect.speed over ALL effects)
+```
+
+When a caster is an NPC/player, OpenMW additionally multiplies by the race's
+male/female weight **unless** `normalise race speed` is enabled in
+`settings.cfg`. Lua cannot read that engine setting, so SFP exposes its own
+equivalent (with the exact same name and meaning) in the global
+`SettingsMagExp_General` storage section:
+
+| Setting | Default | Meaning |
+|:--|:--|:--|
+| `NormaliseRaceSpeed` | `false` | `true` = the race weight IS normalised (every race casts bolts at the same speed; matches OpenMW `normalise race speed = true`). `false` = the race weight is NOT normalised (bolt speed differs by race; matches OpenMW `normalise race speed = false`, the Morrowind default). |
+| `BlockTargetSpellsWhileSwimming` | `true` | `true` = `launchSpell` refuses spells with Target-range effects while the caster is swimming (the whole body in the water — the engine's swim test, water level above ~90% of the caster's height; wading with feet wet still casts). `false` = no restriction. Self and Touch spells always cast. OSSC's own *Block Target Spell Quick Casts While Swimming* toggle gates quick-casts at the source; this setting covers every launch through SFP. |
+
+Set this to the same value as `normalise race speed` in your launcher so SFP
+quick-casts fly at exactly the same speed as vanilla casting. You can toggle
+it in a global script with:
+
+```lua
+local I = require('openmw.interfaces')
+I.MagExp.setNormaliseRaceSpeed(true) -- or false
+```
 
 ### Lifecycle Hooks
 
@@ -129,6 +170,57 @@ self:sendEvent('MagExp_StartQuickCast', {
 
 This enables a single input key to act as both the cast trigger and the charge hold key, creating a seamless tap-to-cast / hold-to-charge mechanic.
 
+### Skill Progression: owning it from another mod
+
+Setting **Skill Progression Mode** to `none` means SFP awards no spellcasting
+experience at all — it is the setting to pick when *your* mod drives
+progression. Two things make that usable:
+
+**1. `MagExp_SkillProgressSkipped`** — fired (as a global event) for every cast
+SFP silenced, so you know when to award:
+
+```lua
+-- in your GLOBAL script's eventHandlers
+MagExp_SkillProgressSkipped = function(data)
+    -- data: { actor, skillId, school, spellId, cost, isEnchant }
+end
+```
+
+It fires only in the `none` mode; when SFP does the awarding itself, nothing is
+announced.
+
+**2. `I.MagExp_Player.awardSkillProgress(skillId, options?)`** — apply the gain
+you computed. Callable from any **player** script, and deliberately *not* gated
+by the setting (it is the way into the `none` mode):
+
+```lua
+local I = require('openmw.interfaces')
+
+-- your own formula, your own amount
+I.MagExp_Player.awardSkillProgress('destruction', { skillGain = 0.35 })
+
+-- or let SFP's own formula size it (cost * MagickaXPMult, or the skill
+-- record's vanilla base gain when no cost is given)
+I.MagExp_Player.awardSkillProgress('destruction', { cost = 18 })
+
+-- or hand the use to NCG / Skill Evolution / MBSP / SUS instead
+I.MagExp_Player.awardSkillProgress('destruction', { backend = 'external' })
+```
+
+| Option | Meaning |
+| --- | --- |
+| `skillGain` | Progress to add, in the unit `skill.progress` is exposed in: `1.0` == one skill level. Major / minor / specialization bonuses are **not** applied — the formula is yours. |
+| `cost` | Spell cost, used for the default gain when `skillGain` is absent. |
+| `useType` | `I.SkillProgression` use type, forwarded on `backend = 'external'`. |
+| `backend` | `'stat'` (default): apply it to the player's skill here. `'external'`: hand the use to `I.SkillProgression.skillUsed`. |
+
+Returns `true` on success, or `false` plus a reason string
+(`'unknown skill: …'`, `'skill is already at 100'`, …) — it never fails silently.
+Crossing a full level raises the skill, plays the vanilla skill-up message and
+sound, and bumps the level counters that feed attribute / specialization
+bonuses at level up. Writing `skill.progress` yourself does none of that: the
+engine only stores the write and never levels from it.
+
 ---
 
 ## 4. `launchSpell` Parameter Reference
@@ -142,12 +234,12 @@ All fields except the first four are optional.
 | **spellId** | `string` | Required | Spell record ID. |
 | **itemObject** | `Object` | `nil` | Source item (for enchantment logic). |
 | **casterLinked** | `boolean` | `false` | If true, hostile reactions are attributed to the `attacker`. |
-| **userData** | `table` | `nil` | Custom per-launch cookie. Returned in all events. |
+| **userData** | `table` | `nil` | Custom per-launch cookie. Returned in all events. May include `ignoreActorRecordIds` — a caller-scoped exclusion list of record IDs (see §25). |
 | |
 | **Movement & Lifecycle** |
 | **startPos** | `Vector3` | Required | World position where the spell spawns. |
 | **direction** | `Vector3` | Required | Initial flight direction. |
-| **speed** | `number` | `1500` | Initial speed (units/sec). |
+| **speed** | `number` | *(auto)* | Initial speed (units/sec). If omitted, speed is auto-detected from the spell's effects using the `fTargetSpellMaxSpeed` GMST and the average of each effect's speed — this is vanilla-parity (Morrowind resolves to ~1000 u/s, not 1500). If that can't be read, the fallback is `fTargetSpellMaxSpeed` (1000 in Morrowind). |
 | **maxSpeed** | `number` | `0` | Speed cap (0 = unlimited). |
 | **minSpeed** | `number` | `0` | Speed floor when decelerating. |
 | **accelerationExp** | `number` | `0` | Exponential speed multiplier per frame. |
@@ -189,6 +281,8 @@ All fields except the first four are optional.
 | **unreflectable** | `boolean` | `false` | Cannot be reflected. |
 | **nonRecastable** | `boolean` | `false` | Aborts if spell is already active on caster. |
 | **itemRequirements** | `table` | `nil` | Inventory requirements check. |
+| **effectScale** | `number` | `1.0` | Penalty to apply to the launch with (`1.0` = none). Magnitudes and the resolved AoE area are scaled by it, so a mod that only *starts* something else with this launch must forward the `effectScale` its cast request reported — otherwise the spell it fires afterwards hits at full strength. Affects everything - summon stats, bound item stats and enchantment stats, spell area, magnitude, duration, aoe visuals|
+| **motionPath** | `table` | `nil` | Curved-path provider: `{ module = <require path>, config = <serializable table> }`. The provider owns the projectile's kinematics (straight-flight integrator is bypassed for opted-in paths). Check `I.MagExp.motionPathVersion` before using; see §24. |
 
 #### `itemRequirements` Details
 The framework can automate inventory checks for the caster. If items are missing, the spell is aborted and a message is displayed to the player.
@@ -529,14 +623,15 @@ Broadcasted globally on every spell impact (projectile, touch, self).
 | `spellId` | `string` | Spell record ID. |
 | `school` | `string` | Magic school (e.g. `"alteration"`). |
 | `element` | `string` | `fire`, `frost`, `shock`, `poison`, `heal`, or `default`. |
-| `damage` | `table` | `{ health, magicka, fatigue }` (Average values). |
-| `magMin` | `number` | Aggregated minimum magnitude. |
-| `magMax` | `number` | Aggregated maximum magnitude. |
+| `damage` | `table` | `{ health, magicka, fatigue }` (Average values), scaled to the cast (reduced for a penalised quick-cast). |
+| `magMin` | `number` | Aggregated minimum magnitude, scaled to the cast. |
+| `magMax` | `number` | Aggregated maximum magnitude, scaled to the cast. |
 | `spellType` | `number` | 0=Self, 1=Touch, 2=Target. |
 | |
 | **Context & Status** |
 | `isAoE` | `boolean` | True if part of an area blast. |
-| `area` | `number` | AoE radius (if applicable). |
+| `area` | `number` | AoE radius (if applicable), already reduced when the hit came from a penalised quick-cast. |
+| `effectScale` | `number` | The quick-cast penalty the hit landed with (`1.0` when the cast was not reduced). Every magnitude, damage and area value above already has it applied. |
 | `unreflectable` | `boolean` | Cannot be reflected. |
 | `casterLinked` | `boolean` | Attributed to caster. |
 | `userData` | `table` | Custom launch cookie. |
@@ -788,6 +883,8 @@ core.sendGlobalEvent('MagExp_BreakInvisibility', { actor = myPlayer })
 ### `MagExp_CastRequest`
 Launch a spell from a player/local script (see §3).
 
+The payload carries `effectScale`, the quick-cast penalty the cast was reduced with (`1.0`, or absent, when it was not reduced). A mod whose spell only *starts* something else — Kinetic Forces launches `kb_launch` / `ke_launch` after the marker cast — must keep that value and pass it to `launchSpell` / `applySpellToActor`, otherwise the payload hits at full damage and detonates at full radius under a penalised quick-cast.
+
 ---
 
 ## 16. Internal Notes
@@ -839,7 +936,7 @@ I.MagExp.emitProjectileFromObject({
     -- Optional Overrides (Behavior is otherwise inherited from the spell record)
     attacker         = someActor, -- Attribution (for reactions/stats)
     startPos         = spawnPos,  -- Defaults to the object's center bounding box
-    speed            = 2500,      -- Initial speed (Defaults to 1500)
+    speed            = 2500,      -- Initial speed (Defaults to auto-detected vanilla speed)
     spawnOffset      = 80,        -- Distance ahead of startPos to spawn
     maxLifetime      = 10,        -- Expiry timeout in seconds
     area             = 15,        -- AoE override
@@ -1084,6 +1181,190 @@ self:sendEvent('MagExp_StartQuickCast', {
 - If you call `MagExp_StartQuickCast` **without** the `chargeKey` field (or pass `nil`), the system behaves exactly as before: instant cast only, no charge loop.
 - Existing mods using the framework are unaffected.
 - The `launchSpellAnim` API (§22) still supports explicit `isCharged = true` mode for custom animation groups with standalone charge loops independent of the cast trigger.
+
+---
+
+## 24. Curved Motion Paths (`motionPath`)
+
+SFP can fly a projectile along a caller-owned curved path instead of its
+default straight-line integrator. Check `I.MagExp.motionPathVersion`
+(`= 1` in this bundle) before opting in:
+
+```lua
+local I = require('openmw.interfaces')
+if I.MagExp and I.MagExp.motionPathVersion == 1 then
+    I.MagExp.launchSpell({
+        attacker = actor, spellId = 'orbit_bolt',
+        startPos = pos, direction = dir,
+        motionPath = {
+            module = 'scripts/mymod/trajectory_path',  -- loadable in global AND local contexts
+            config = { shape = 'orbiting', radius = 64 }, -- serializable; your schema
+        },
+    })
+end
+```
+
+### Provider contract
+
+`module` must `require()` to a table with at least:
+
+| Function | Called | Purpose |
+|:--|:--|:--|
+| `validate(config)` | at launch, before any carrier is allocated | reject malformed configuration (raise an error) |
+| `create(config, { position, direction })` | at launch | build the local path state (a table with the methods below) |
+
+and the returned path state must provide:
+
+| Method | Returns / effect |
+|:--|:--|
+| `velocity()` | current tangent vector |
+| `stepDuration(maxDt)` | suggested step size ≤ `maxDt` (shorten at path corners) |
+| `advance(dt)` | `nextPosition, nextVelocity` |
+| `warp(position)` | re-anchor the path (e.g. a discrete jump) |
+| `redirect(position, velocity)` | re-anchor with a new velocity — used by explicit `velocity`/`speed`/`direction` overrides |
+| `bounce(position, normal, restitution)` | bounce the path off a surface (bounce-enabled projectiles) |
+
+Rules and boundaries:
+
+- **Providers own their kinematics**, including acceleration. The ordinary
+  SFP force integrator (`forceVec`/`accelerationExp`/speed rules) is bypassed
+  for opted-in paths; providers that want straight flight can still do it
+  themselves.
+- **Provider programming errors are not suppressed** — a provider that raises
+  outside its `validate`/`create` calls will fail the launch visibly.
+- Curved movement advances in **at most 8 sub-steps of at most 1/60 s per
+  update**. Each straight chord passes through the *existing* actor/world
+  collision and piercing logic — the chords approximate the curve, the
+  individual raycasts are still straight.
+- A long frame advances the projectile **lifetime fully** but caps path
+  travel at the sub-step budget (no catch-up backlog); extreme hitches can
+  briefly slow traversal without extending expiry.
+- Warp and bounce-clearance gaps are **not** swept as travelled space.
+- Ordinary callers are unaffected: without `motionPath`, everything behaves
+  exactly as before and no provider module is required.
+
+### Consuming the travelled path (beam geometry)
+
+For path projectiles, SFP emits one `MagExp_ProjectileMove` per path update
+with `localMotionPath = true`, the authoritative tangent `velocity`, and up
+to eight `motionSegments = { startPos = v, endPos = v }` entries — the actual
+chords travelled. Early termination flushes the travelled prefix, and warp
+tags survive event coalescing. Beam and contact consumers (e.g. WandForge's
+beam, Pollen) should consume these segments instead of assuming straight
+motion between samples.
+
+WandForge's own provider reuses its Orbiting Arc, Spiral Arc and composed
+path formulas; global tangent steering stands down for these paths while
+Phasing Arc's explicit warps remain. Speed-based damage (§9) uses the tangent
+speed, so impact speed follows the curve.
+
+---
+
+## 25. Caller-Scoped Target Exclusions (`userData.ignoreActorRecordIds`)
+
+Keep a launch from ever hitting specific actors — e.g. "mushroom-origin
+attacks spare mushrooms". Pass the list in the `userData` of `launchSpell`,
+`applySpellToActor`, `detonateSpellAtPos` or `MagExp_CastRequest`:
+
+```lua
+I.MagExp.launchSpell({
+    attacker  = mushroom,
+    spellId   = 'spore_cloud',
+    startPos  = pos, direction = dir,
+    userData  = {
+        ignoreActorRecordIds = { 'brown_mushroom', 'blue_mushroom', 'elite_blue_mushroom' },
+        -- or map form: { ['brown_mushroom'] = true, ... } — both work
+    },
+})
+```
+
+- Actors whose `recordId` is in the list (matched **case-insensitively**)
+  are excluded from **projectile collision rays, direct spell application
+  and AoE actor selection** — before damage, feedback and hit broadcasts.
+- It is **caller-scoped, not a global immunity**: only the launch that
+  carries the list honours it. Player-origin attacks that carry no list
+  still damage the excluded actors (a targeted "your own family is safe"
+  filter, not a spell-immunity toggle).
+- No signature or registration change — it rides the existing `userData`
+  cookie, which is also returned in all events.
+- If your spell *launches another spell* (payloads, terminal bursts,
+  scattering fragments), you must carry the exclusion list into each
+  separately launched payload — SFP does not forward `userData` between
+  independent launches.
+
+---
+
+## 26. World-Pause Behavior
+
+During a world pause (menus, map, loading screen) OpenMW still delivers
+events and **zero-duration** updates. This bundle makes SFP pause-safe:
+
+- **`launchSpell`** — including every call routed through
+  `emitProjectileFromObject` — raises
+  `error('SFP launchSpell: world_paused; resume before calling or use
+  MagExp_CastRequest')` *before* any resource consumption, effect
+  application or carrier creation. This is an intentional behavior change,
+  not an opt-in field: a synchronous caller that needs its projectile now
+  must wait for resume. Returning `nil` was not an option because `nil`
+  already means "successful non-projectile cast" for some callers.
+- **`MagExp_CastRequest` is the deferred alternative.** While paused, up to
+  **128** cast requests wait in the pause queue; overflow is rejected with
+  one log message per pause, and invalid casters are discarded immediately.
+  On resume the queue is flushed in order. A deferred failure reports the
+  original error text plus the operation name and is **not replayed** — the
+  earlier parts of a cast may already have succeeded, and replaying would
+  double-apply them.
+- **Projectile local scripts skip `dt <= 0` updates**: no position
+  publication, no lifetime advance, no collision rays during a paused frame.
+  Positive-duration updates resume normal movement and lifetime progression.
+- **Native teleports are deferred, never issued while paused.** Projectile
+  and anchor (sound/light) movements are retained as Lua data and placed
+  natively only during an unpaused update; warp fields are notifications of
+  local simulation, not native-completion acknowledgements, and are not
+  rebroadcast.
+- **Retries and cancellation pause-aware:** move-event retries stop while
+  paused (they resume after, within their existing bounds); repeated
+  `cancelSpell` during a pause does not renew the cancellation grace period;
+  terminal cleanup discards waiting work while keeping the lifecycle
+  backstop until cleanup completes.
+- **Save/load:** pending pause work belongs to the current world and is
+  *not* serialized into a loaded save (saving without loading does not
+  permanently stop spells).
+- The queued cast/anchor operations run their guards directly, as
+  check-then-act preconditions (`dt <= 0` / `isActive` / `isValid`-style
+  queries before each operation) — errors are not swallowed. The OpenMW Lua
+  sandbox does not expose the standard `debug` library, so the early
+  `debug.traceback` `xpcall` handlers crashed the global `onUpdate` instead
+  (104 `attempt to index global 'debug'` errors in one playtest — the bug
+  fixed in bundle change 27); the `pcall` guards added there have since been
+  replaced by asking the condition first (the `anim.hasAnimation` guards in
+  the projectile and actor VFX scripts are the same pattern). The one
+  sanctioned `pcall` use in the bundle is `pcall(require, ...)` for optional
+  companion modules, where absence is expected and keeps its fallback
+  (change 33).
+- Projectile freeze (`isPaused` / `setSpellPaused`) and world pause remain
+  distinct mechanisms.
+
+No public function arguments or existing event names were removed by these
+changes.
+
+---
+
+## 27. Side Changelog (26–33)
+
+Changes layered on the SFP 3.14 base by the OSSC maintainers. Full write-ups
+with problems, validation and boundaries: `../side-slowchu-sfp-changes/changes.txt`.
+
+| # | Date | Change |
+|:--|:--|:--|
+| 26 | 2026-09-11 | **World-pause movement and cast handling.** `dt <= 0` updates skipped in the projectile local script; native teleports deferred to unpaused updates; up-to-128 `MagExp_CastRequest` queue with overflow rejection; `world_paused` error from `launchSpell`. See §26. |
+| 27 | 2026-09-14 | **OpenMW sandbox correction.** Replaced `debug.traceback` `xpcall` handlers with `pcall` in the pause-work guards — OpenMW has no `debug` library, so the section-26 patch itself was crashing the global `onUpdate` (104 errors in one playtest log). Operation boundaries and error messages unchanged. |
+| 28 | 2026-09-16 (installed) | **Player AoE damage + caller ally exclusions.** SFP's AoE target list omitted the player on OpenMW 0.51 (area blasts could skip the player, including intended self-damage) — `detonateSpellAtPos` now combines `cell:getAll()` with `cell:getAll(types.Player)` and deduplicates by object ID, retaining the range/dead/lockable/`excludeTarget` behavior. `userData.ignoreActorRecordIds` extended to direct spell application and AoE actor selection. See §25. |
+| 29 | deployed 2026-09-16 (tested) | **Creation ownership and queued-request failure handling.** `creationOwnership` tracks created carriers and sound/light anchors immediately after creation so partially-completed launches can never lose an object; required `hasScript`/`addScript` errors propagate; queued casts validate source, spell ID and position/direction inside each request's isolation boundary; removals are confirmed by object invalidity or a zero count on a later unpaused update (a zero count right after an accepted removal is not proof — OpenMW reuses it during pending teleports); pending cleanup references survive save/load for retirement. Validated by four LuaJIT suites plus a native 0.51 run (`20260916-165506-493-6ba8b6`). |
+| 30 | deployed 2026-09-16 (tested) | **Local curved motion and travelled beam geometry.** The `motionPath` provider system, `I.MagExp.motionPathVersion = 1`, ≤ 8 × (1/60 s) sub-stepping with per-chord collision, and `motionSegments` on `MagExp_ProjectileMove`. Fixing it eliminated a ~66-unit orbit displacement over 150 ms of straight-tangent flight. See §24. |
+| 31 | — | **Isolated mushroom-family integration and test package** (`WandForge-Mushroom-Family-v1_8.zip`). Exercises the bundle's caller-scoped exclusions and entries 26–30; introduces no new required SFP API. |
+| 32 | 2026-09-21 | **Scroll casts under the effect penalty.** Enchanted casts now apply through the ITEM record id (never the enchantment id, which the engine cannot resolve), with the item identity folded to a record-id string before the scroll is consumed and every later handle read gated behind `isValid()`; stand-ins whose `active.item` is nil are matched by record identity; generated-record effect counts are read leniently; a cast with no resolvable item record falls back to an unpenalised generated clone instead of dying at `activeSpells:add`. OSSC's NPC/creature item quick-cast no longer pre-consumes scroll/charge (SFP's launch resource guard is the single consumer, mirroring the player path). `QuickCastEffectPenaltyScrollsExempt` semantics unchanged. See `../side-slowchu-sfp-changes/changes.txt` §32. |
+| 33 | 2026-09-21 | **Error-handling policy made explicit (documentation).** `pcall` is used for exactly one thing in the bundle: `pcall(require, ...)` when loading an optional companion module (Pure Lua Multi Mark's `PMM_renameDialog`/`PMM_markWindow`, Skill Uses Scaled's data module) — absence is expected and keeps the existing fallbacks (rename stubs, the window-load cancel path, "SUS will use its own fallback"). Everything else — engine calls, item-handle reads (change 32), the pause/queue guards — runs unguarded behind check-then-act preconditions (`isValid()`, `hasAnimation`, `dt <= 0`) so real errors surface. §26's stale "caught with `pcall`" claim about the queued cast/anchor operations is corrected. See `../side-slowchu-sfp-changes/changes.txt` §33. |
 
 ---
 

@@ -1,11 +1,20 @@
 -- ============================================================
--- magexp_actor_vfx.lua (LOCAL script — attached to NPC/Creature targets)
+-- magexp_actor_vfx.lua (LOCAL script - attached to NPC/Creature targets)
 -- ============================================================
 
 local self = require('openmw.self')
 local anim = require('openmw.animation')
 
 local debugLog = require('scripts/OMW_MagExp/magexp_logger').new('[MagExp VFX Actor]')
+
+-- anim.addVfx and anim.removeVfx both raise "Object has no animation" on an
+-- actor that has none. These handlers used to wrap each call in pcall and
+-- swallow the result, which hid the failure and also hid every other error the
+-- call could raise. Ask first instead: the condition is queryable, and there
+-- is nothing to undo when it is false.
+local function hasAnimation()
+    return anim.hasAnimation(self)
+end
 
 return {
     engineHandlers = {
@@ -15,31 +24,25 @@ return {
     },
     eventHandlers = {
         RemoveVfx = function(tag)
-            --debugLog("RemoveVfx event received for tag: " .. tostring(tag) .. " on " .. (self.recordId or "unknown"))
-            local ok, err = pcall(function()
-                anim.removeVfx(self, tag)  -- Pass self as first argument
-            end)
-            if ok then
-                --debugLog("Successfully removed VFX: " .. tostring(tag))
-            else
-                --debugLog("Failed to remove VFX: " .. tostring(err))
+            if not hasAnimation() then
+                debugLog("RemoveVfx skipped - actor has no animation: "
+                    .. tostring(self.recordId))
+                return
             end
+            anim.removeVfx(self, tag)
         end,
         AddVfx = function(data)
             if not data or not data.model then
-                --debugLog("AddVfx called with invalid data")
+                debugLog("AddVfx called with invalid data")
                 return
             end
-            --debugLog("AddVfx event received for model: " .. tostring(data.model))
-            local opts = data.options or {}
-            local ok, err = pcall(function()
-                anim.addVfx(self, data.model, opts)  -- Pass self as first argument
-            end)
-            if ok then
-                --debugLog("Successfully added VFX")
-            else
-                --debugLog("Failed to add VFX: " .. tostring(err))
+            if not hasAnimation() then
+                debugLog("AddVfx skipped - actor has no animation: "
+                    .. tostring(self.recordId))
+                return
             end
+            local opts = data.options or {}
+            anim.addVfx(self, data.model, opts)
         end,
     }
 }
