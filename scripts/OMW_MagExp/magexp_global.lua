@@ -1887,249 +1887,370 @@ end
 -- so a later vanilla cast of the *same* spell cannot see the reduced one and
 -- both stay active.  (The other order already worked: the penalised path
 -- removes the source itself before adding its replacement.)  Every reduced
--- cast is recorded here with the source id it stands in for; the per-frame
--- sweep drops it as soon as the engine adds the real spell to the same actor.
+-- cast is recorded here with the source id it stands in for; the state watch
+-- below drops the stand-in as soon as the engine adds the real spell to the
+-- same actor.
 --
--- A vanilla cast can also collide with a quick-cast *summon* without sharing
--- its spell id.  The engine's summon bookkeeping is keyed by the magic-effect
--- id (CreatureStats::getSummonedCreatureMap, a multimap filled by
--- summonCreature), so a vanilla summon of a DIFFERENT spell that carries the
--- same Summon effect spawns a second creature and leaves both active-spell
--- entries standing — the quick-cast summon is never disbanded, which is the
--- bug this registry exists to close.  Summons must not stack unless the spell
--- is explicitly stackable, so the same sweep that handles the record-id case
--- also disbands our reduced stand-in the moment a foreign vanilla summon of a
--- matching effect shows up in front of it, mirroring removeSourceForReducedSpell
--- ('quick-cast over a vanilla summon disbands it') in the reverse order.
--- Removing the stand-in runs the engine's own cleanup for its summon: the
--- creature, its VFX, and its ledger entry (cleanupSummonedCreature).
+-- This registry used to also police the summon case by re-classifying every
+-- active spell on its target on every frame.  That case belongs to the state
+-- watch now: a quick-cast stand-in is the holder of its creature kind, and a
+-- later vanilla summon of the *same creature* — the same spell, or a
+-- different one carrying the same Summon effect — is an arrival, and an
+-- arrival takes the kind away from the holder.  The engine's summon
+-- bookkeeping is keyed by the magic-effect id
+-- (CreatureStats::getSummonedCreatureMap, a multimap filled by
+-- summonCreature), which is exactly why a spell id can never be the key for
+-- this rule and the effect's own creature/item kind is.  Removing the
+-- stand-in runs the engine's own cleanup for its summon: the creature, its
+-- VFX, and its ledger entry (cleanupSummonedCreature).
 -- ============================================================
-local reducedCastRegistry = {}   -- [actorId|generatedId] = record
-local reducedGeneratedKeys = {} -- every generated stand-in id this script made
+local reducedCastRegistry = {}   -- [actorId][generatedKey] = { target, sourceId, ... }
 
--- A quick-cast summon applied at FULL strength (no penalty) has no generated
--- stand-in, so sweepReducedCasts cannot see it; the next vanilla summon of the
--- same effect would spawn a second creature and the quick-cast one would never
--- be disbanded.  Those casts are registered here too, keyed by target and
--- source spell, and re-checked below on the same "overlapping summon effect"
--- rule: the first later vanilla active spell whose summon effect overlaps ours
--- wins, and the quick-cast summon — which the engine still disbands when the
--- active spell carrying SummonX is purged — is purged right there.
-local unpenalizedSummonRegistry = {} -- [actorId|spellKey] = { target, sourceKey, summonEffects }
-local UNPENALIZED_SUMMON_INTERVAL = 0.1  -- per-entry re-check cadence (seconds)
-local UNPENALIZED_SUMMON_EXPIRY  = 6.0  -- stop polling a target long after the cast
+--- Defined with the state watch below: the registry only has to ask for one.
+local ensureActorSpellWatch
 
---- Register a reduced cast so the sweep can recognise what replaced it.
---- `summonEffects` is the set of normalised summon-effect ids the reduced
---- cast carries (empty for a non-summon); it arms the summon guard below.
-local function registerReducedCast(target, generatedId, sourceId, summonEffects)
+--- Register a reduced cast so the state watch can recognise what replaced it.
+--- Nothing else is remembered here: whether a spell summons a creature, and
+--- which, is derived from the record once and kept in the classification
+--- caches below instead of being recomputed for every entry of every actor on
+--- every pass (which is what used to cost the frame rate).
+local function registerReducedCast(target, generatedId, sourceId)
     if not (target and target:isValid()) then return end
     if type(generatedId) ~= 'string' or type(sourceId) ~= 'string' then return end
     if generatedId == sourceId then return end
 
-    local effectSet = {}
-    if type(summonEffects) == 'table' then
-        for effId in pairs(summonEffects) do
-            effectSet[effId] = true
-        end
-    end
-
+    local actorId = tostring(target.id)
     local generatedKey = activeSpellIdKey(generatedId)
-    reducedGeneratedKeys[generatedKey] = true
-
-    reducedCastRegistry[tostring(target.id) .. '|' .. generatedKey] = {
+    local byActor = reducedCastRegistry[actorId]
+    if not byActor then
+        byActor = {}
+        reducedCastRegistry[actorId] = byActor
+    end
+    byActor[generatedKey] = {
         target = target,
-        targetId = tostring(target.id),
+        targetId = actorId,
         generatedId = generatedId,
         generatedKey = generatedKey,
         sourceId = sourceId,
         sourceKey = activeSpellIdKey(sourceId),
-        summonEffects = effectSet,                 -- normalised summon effect ids
-        summonGuard = next(effectSet) ~= nil,      -- true when this cast summoned
     }
+    ensureActorSpellWatch(target)
 end
 
---- The effect ids of one kind (summon or bound) that an active-spell entry
---- carries, read from `inst.effects[].id` (and, after a reload or on older
---- engines, resolved through the record the entry's id points at).  Returns
---- a set of normalised effect-id keys, or nil when the entry has
---- none/unknown.  `isKindEffect` decides membership; the summon sweep and
---- the bound/summon displacement sweep below share this reader.
-local function collectActiveEffectIds(inst, isKindEffect)
-    local kindEffects, count = {}, 0
-    local function addEffectId(rawId)
-        if rawId == nil then return end
-        local key = tostring(rawId):lower():gsub('[^%a%d]', '')
-        if key ~= '' and isKindEffect(key) and not kindEffects[key] then
-            kindEffects[key] = true
-            count = count + 1
-        end
-    end
+-- ============================================================
+-- [ACTIVE-SPELL EFFECT CLASSIFICATION] One answer per record, kept
+--
+-- Every summon/bound rule in this file starts from the same question: does
+-- this active-spell entry carry a Summon or a BoundX effect, and which
+-- creature record / item record does that effect occupy?  The sweeps used to
+-- ask it again on every pass for every entry — and, worse, the "no" answer
+-- fell through to a record lookup, so a potion or an ingredient paid a
+-- *linear scan of the whole spell, enchantment and item stores* just to be
+-- told "nothing here".  With many effects standing on an actor that is
+-- thousands of record visits and a few thousand string allocations per entry
+-- per pass, multiplied by every loaded actor: the frame-rate collapse the
+-- state watch below exists to end.
+--
+-- The answers are therefore computed once and remembered:
+--
+--   * the normalised (letters-only, lowercase) form of an effect id is
+--     memoised per distinct id it was read from — the summon and bound tables
+--     in this file are keyed on that form, and there are only a few hundred
+--     distinct magic effect ids in a load order;
+--   * which item records a bound effect equips — including the wildcard and
+--     the "not a bound effect" answers, the ones that run the name heuristics
+--     in boundEffectItemIds — is memoised per normalised effect id;
+--   * the effect list an *entry's record* resolves to is memoised per record
+--     id, negative answers included, and the stores it is looked up in are
+--     indexed once for case-insensitive lookups instead of walked per
+--     question.
+--
+-- The entry's own effect list is still the first and best answer (a cast may
+-- apply only some of its spell's effects, so a record-derived answer could
+-- claim kinds this cast never applied); it is simply cheap now, because every
+-- sub-question it asks is a hash lookup.
+--
+-- The helpers below are fields of one table on purpose: a chunk-level local
+-- costs one of the 200 local slots the Lua VM allows per function, and this
+-- file is large enough to have to count them.
+-- ============================================================
+local effectKindProbe = {
+    EMPTY_KIND_SET = {},
+    effectIdKeyCache = {},      -- [raw effect id] = normalised key, false = no key
+    boundKindCache = {},        -- [normalised effect id] = bound item set, false = not bound
+    recordEffectIdsCache = {},  -- [record id] = its normalised effect ids, false = unresolvable
+    foldedStoreIndexes = {},    -- [record store] = { [lowercase record id] = record | false }
+    boundSlotKeyCache = {},     -- [item record id] = its equip-slot kind, false = unknown slot
+    slotEnumCache = nil,        -- { armor = [type value] = slot kind, clothing = ... }
+}
 
+--- Forget everything derived from a record.  Records are stable while a load
+--- order is running, but a load is exactly when that assumption can be wrong,
+--- so the caches go with it (they rebuild lazily, one record at a time).
+function effectKindProbe.clearRecordCaches()
+    effectKindProbe.effectIdKeyCache = {}
+    effectKindProbe.boundKindCache = {}
+    effectKindProbe.recordEffectIdsCache = {}
+    effectKindProbe.foldedStoreIndexes = {}
+    effectKindProbe.boundSlotKeyCache = {}
+    effectKindProbe.slotEnumCache = nil
+end
+
+--- The letters-only lowercase form of an effect id — the key every summon and
+--- bound table here is built on.  Memoised: the sweeps ask this about effects
+--- they have never seen before, and the string work belongs to the first
+--- sighting of each distinct id, not to every entry that carries it.
+function effectKindProbe.normaliseEffectId(rawId)
+    if rawId == nil then return nil end
+    local text = rawId
+    if type(text) ~= 'string' then text = tostring(text) end
+    local cached = effectKindProbe.effectIdKeyCache[text]
+    if cached == nil then
+        local key = text:lower():gsub('[^%a%d]', '')
+        cached = (key ~= '') and key or false
+        effectKindProbe.effectIdKeyCache[text] = cached
+    end
+    if cached == false then return nil end
+    return cached
+end
+
+--- The item records a bound-equipment effect equips, or nil when it is not a
+--- bound effect at all (so `boundKindItems(effKey) ~= nil` is the "is this a
+--- bound effect" test).  Memoised per normalised effect id: the wildcard
+--- answer (a modded effect that only *looks* like bound equipment) and the
+--- negative answer both cost the id/name heuristics behind
+--- boundEffectItemIds, and both are remembered.
+function effectKindProbe.boundKindItems(effKey)
+    if type(effKey) ~= 'string' or effKey == '' then return nil end
+    local cached = effectKindProbe.boundKindCache[effKey]
+    if cached == nil then
+        cached = boundEffectItemIds(effKey) or false
+        effectKindProbe.boundKindCache[effKey] = cached
+    end
+    if cached == false then return nil end
+    return cached
+end
+
+--- The effect ids an active-spell entry's own effect list carries that
+--- `isKindEffect` accepts.  Returns the set, plus a second value saying
+--- whether the list was readable at all: a readable list that holds nothing
+--- the predicate accepts is a complete answer, and the caller must not go
+--- looking for the record afterwards.  (Falling through on that case is what
+--- made every potion and every ingredient cost a full record scan.)
+function effectKindProbe.readEntryEffectIds(inst, isKindEffect)
     local effects = inst and inst.effects
-    if effects then
-        for _, eff in pairs(effects) do
-            -- ESM::ActiveEffect userdata: expose the effect id as either field.
-            addEffectId(eff and (eff.id or eff.effectId))
-        end
-    end
-    if count > 0 then return kindEffects end
-
-    -- Reloads (and older engines) may not expose per-effect ids on the entry;
-    -- fall back to the record the entry's id points at. Record lookups are
-    -- case-insensitive because the engine may hand back ids in varying case
-    -- (e.g. FormId vs lowercase) and the store itself is case-insensitive in
-    -- vanilla but the Lua proxy may not be on older builds.
-    local rid = inst and inst.id
-    if type(rid) ~= 'string' or rid == '' then return nil end
-
-    local function collectRecordEffects(record)
-        if not record then return false end
-        local found = false
-        for _, eff in ipairs(record.effects or {}) do
-            addEffectId(eff and (eff.id or eff.effectId or eff.effect and eff.effect.id))
-            found = true
-        end
-        return found
-    end
-
-    local function findSpellRecord(id)
-        if not id then return nil end
-        local rec = core.magic.spells.records[id]
-        if rec then return rec end
-        rec = core.magic.spells.records[id:lower()]
-        if rec then return rec end
-        local lower = id:lower()
-        for _, r in pairs(core.magic.spells.records) do
-            if r.id and tostring(r.id):lower() == lower then return r end
-        end
-        return nil
-    end
-
-    local function findEnchantRecord(id)
-        if not id or not core.magic.enchantments then return nil end
-        local rec = core.magic.enchantments.records[id]
-        if rec then return rec end
-        rec = core.magic.enchantments.records[id:lower()]
-        if rec then return rec end
-        local lower = id:lower()
-        for _, r in pairs(core.magic.enchantments.records) do
-            if r.id and tostring(r.id):lower() == lower then return r end
-        end
-        return nil
-    end
-
-    local record = findSpellRecord(rid) or findEnchantRecord(rid)
-    if collectRecordEffects(record) then return (count > 0) and kindEffects or nil end
-
-    -- An enchantment cast lives under the *item*'s record id; resolve the
-    -- item's enchantment effect list for the scroll/weapon/armor cases.
-    local itemRec = nil
-    local itemStores = {
-        types.Weapon and types.Weapon.records,
-        types.Armor and types.Armor.records,
-        types.Book and types.Book.records,
-        types.Clothing and types.Clothing.records,
-        types.MiscItem and types.MiscItem.records,
-    }
-    for _, store in ipairs(itemStores) do
-        if type(store) == 'table' then
-            local rec = store[rid] or store[rid:lower()]
-            if rec then
-                itemRec = rec
-                break
-            end
-            local lower = rid:lower()
-            for _, r in pairs(store) do
-                if r.id and tostring(r.id):lower() == lower then
-                    itemRec = r
-                    break
+    if not effects then return nil, false end
+    local out, count, readable = nil, 0, false
+    for _, eff in pairs(effects) do
+        local rawId = eff and (eff.id or eff.effectId)
+        if rawId ~= nil then
+            readable = true
+            local key = effectKindProbe.normaliseEffectId(rawId)
+            if key and isKindEffect(key) then
+                if not out then out = {} end
+                if not out[key] then
+                    out[key] = true
+                    count = count + 1
                 end
             end
-            if itemRec then break end
         end
     end
-    if itemRec then
-        local enchantId = itemRec.enchant
-        if type(enchantId) == 'string' and enchantId ~= ''
-            and core.magic.enchantments then
-            collectRecordEffects(findEnchantRecord(enchantId)
-                or core.magic.enchantments.records[enchantId])
+    if not readable then return nil, false end
+    if count == 0 then return nil, true end
+    return out, true
+end
+
+--- Look a record id up in a store without ever walking the store again.  The
+--- engine's stores are case-insensitive, the Lua proxy is not on every build,
+--- and the id a cast reports can vary in case, so the first miss builds a
+--- lowercase index of that store (once per session) and a record id that is
+--- not in the store is remembered as a miss.
+function effectKindProbe.storeLookup(store, recordId)
+    if type(store) ~= 'table' or type(recordId) ~= 'string' or recordId == '' then return nil end
+    local direct = store[recordId]
+    if direct ~= nil then return direct end
+    local lower = recordId:lower()
+    local index = effectKindProbe.foldedStoreIndexes[store]
+    if index == nil then
+        index = {}
+        for id, record in pairs(store) do
+            local rid = record and record.id
+            if type(rid) == 'string' then index[rid:lower()] = record end
+            if type(id) == 'string' and index[id:lower()] == nil then index[id:lower()] = record end
+        end
+        effectKindProbe.foldedStoreIndexes[store] = index
+    end
+    local found = index[lower]
+    if found == nil then
+        index[lower] = false
+        return nil
+    end
+    if found == false then return nil end
+    return found
+end
+
+--- The normalised effect ids of the record an active-spell entry's id points
+--- at, or nil when this build cannot resolve it.  Every answer — including
+--- "there is no such record with effects" — is remembered per record id,
+--- which is what keeps a potion or an ingredient from being looked at twice.
+function effectKindProbe.recordEffectIds(recordId)
+    if type(recordId) ~= 'string' or recordId == '' then return nil end
+    local cached = effectKindProbe.recordEffectIdsCache[recordId]
+    if cached ~= nil then
+        if cached == false then return nil end
+        return cached
+    end
+
+    local ids = {}
+    local function collect(record)
+        for _, eff in ipairs((record and record.effects) or {}) do
+            local key = effectKindProbe.normaliseEffectId(
+                eff and (eff.id or eff.effectId or eff.effect and eff.effect.id))
+            if key then ids[#ids + 1] = key end
         end
     end
 
-    if count > 0 then return kindEffects end
+    local record = nil
+    if core.magic.spells then record = effectKindProbe.storeLookup(core.magic.spells.records, recordId) end
+    if record then
+        collect(record)
+    else
+        if core.magic.enchantments then record = effectKindProbe.storeLookup(core.magic.enchantments.records, recordId) end
+        if record then
+            collect(record)
+        else
+            -- An enchantment cast lives under the *item*'s record id: resolve
+            -- the item's enchantment effect list for the scroll/weapon/armor
+            -- cases.  (The item record itself carries no magic effects.)
+            local itemRec = nil
+            for _, store in ipairs({
+                types.Weapon and types.Weapon.records,
+                types.Armor and types.Armor.records,
+                types.Book and types.Book.records,
+                types.Clothing and types.Clothing.records,
+                types.MiscItem and types.MiscItem.records,
+            }) do
+                if type(store) == 'table' then
+                    itemRec = effectKindProbe.storeLookup(store, recordId)
+                    if itemRec then break end
+                end
+            end
+            local enchantId = itemRec and itemRec.enchant
+            if type(enchantId) == 'string' and enchantId ~= '' and core.magic.enchantments then
+                collect(effectKindProbe.storeLookup(core.magic.enchantments.records, enchantId))
+            end
+        end
+    end
+
+    if #ids == 0 then
+        effectKindProbe.recordEffectIdsCache[recordId] = false
+        return nil
+    end
+    effectKindProbe.recordEffectIdsCache[recordId] = ids
+    return ids
+end
+
+--- The record of an item id through one of the item type tables, or nil.
+--- `types.X.record(objectOrRecordId)` is the engine's own lookup and answers
+--- nil for an id this build has no record for (a mod's item, an engine too old
+--- for the store), so a bound effect can always be asked about without a
+--- guard around every call.
+function effectKindProbe.itemRecordOf(itemType, itemId)
+    if not itemType then return nil end
+    local get = itemType.record
+    if type(get) == 'function' then return get(itemId) end
+    local records = itemType.records
+    if type(records) == 'table' then return records[itemId] end
     return nil
 end
 
---- The summon effect ids an active-spell entry carries (normalised keys).
-local function collectActiveSummonEffects(inst)
-    return collectActiveEffectIds(inst, isSummonEffectId)
-end
-
---- True when the normalised effect id is a bound-equipment effect — an
---- entry in the engine's own bound list, a magic effect with an Item field,
---- or a modded effect whose id/name spells "bound".
-local function isBoundEffectId(effKey)
-    return boundEffectItemIds(effKey) ~= nil
-end
-
---- The bound effect ids an active-spell entry carries (normalised keys).
-local function collectActiveBoundEffects(inst)
-    return collectActiveEffectIds(inst, isBoundEffectId)
-end
-
---- True when two summon-effect sets share at least one effect id.
-local function summonEffectsOverlap(a, b)
-    if not (a and b) then return false end
-    for effId in pairs(a) do
-        if b[effId] then return true end
+--- The equip-slot kind keys, keyed by the numeric type value each item type
+--- table publishes.  Built lazily from `types.Armor.TYPE` / `types.Clothing.TYPE`
+--- so an engine that does not publish a given name simply leaves that type
+--- unresolved (the item id becomes the kind, which never collides with
+--- another item's).
+function effectKindProbe.slotEnumKeys()
+    local keys = effectKindProbe.slotEnumCache
+    if keys then return keys end
+    local function build(enum, names)
+        local out = {}
+        if enum then
+            for name, slotKey in pairs(names) do
+                local value = enum[name]
+                if value ~= nil then out[value] = slotKey end
+            end
+        end
+        return out
     end
-    return false
+    keys = {
+        armor = build(types.Armor and types.Armor.TYPE, {
+            Helmet = 'helm', Cuirass = 'cuirass',
+            LPauldron = 'leftpauldron', RPauldron = 'rightpauldron',
+            Greaves = 'greaves', Boots = 'boots',
+            LGauntlet = 'leftgauntlet', RGauntlet = 'rightgauntlet',
+            Shield = 'carriedleft',
+            LBracer = 'leftbracer', RBracer = 'rightbracer',
+        }),
+        -- Clothing shares slots with armor (gloves sit in the gauntlet slots,
+        -- shoes in the boots slot), which is how the engine equips them.
+        clothing = build(types.Clothing and types.Clothing.TYPE, {
+            Amulet = 'amulet', Belt = 'belt',
+            LGlove = 'leftgauntlet', RGlove = 'rightgauntlet',
+            Pants = 'pants', Robe = 'robe', Ring = 'ring',
+            Shirt = 'shirt', Shoes = 'boots', Skirt = 'skirt',
+        }),
+    }
+    effectKindProbe.slotEnumCache = keys
+    return keys
 end
 
--- ============================================================
--- [BOUND & SUMMON DISPLACEMENT] One summon per creature kind, one bound
--- effect per item kind — retroactive replacement, newest cast wins.
---
--- Vanilla forbids stacking a bound/summon effect: its magnitude is forced
--- to 1 and a new application REPLACES the older one — you cannot hold two
--- of the same creature or two of the same bound item.  The engine only
--- enforces this per spell record (a non-stackable recast replaces itself),
--- so two DIFFERENT spells carrying the same Summon or BoundX effect — a
--- vanilla spell and a quick-cast stand-in, two modded spells, a scroll and
--- a spell — stay active side by side and produce two scamps / two bound
--- daggers.
---
--- This closes the gap for every source at once.  A cast's summon/bound
--- effects are folded to *kind keys*: the creature record id the engine
--- spawns for a summon effect and the item record ids a bound effect equips,
--- so even two different effect ids that summon the same creature (a modded
--- copy of a vanilla effect) displace each other, exactly like two casts of
--- the same effect id do.  When a cast lands, older active spells on the
--- same actor sharing one of its kind keys are removed by their per-cast
--- active-spell id; the engine's own cleanup for the losing effect then
--- disbands its creature / takes back its bound item.  A polled sweep (every
--- DISPLACEMENT_SWEEP_INTERVAL of sim time, over world.players and
--- world.activeActors) enforces the same newest-wins rule for casts this
--- script never sees — a plain vanilla cast, an NPC's spell — by tracking,
--- per actor and kind, the cast that currently holds the slot: a cast key
--- that is new for the kind is the newer cast, and the previous holders
--- lose.  Removing a whole active spell (never just one effect) is what
--- keeps the engine's own summon/bound bookkeeping consistent, the same
--- contract the reduced-cast sweeps below rely on.
--- ============================================================
+--- The equipment slot an item record occupies, as a kind key: 'carriedright'
+--- for any weapon, the armor/clothing table's own slot for everything worn.
+--- Nil when this build cannot tell (unknown record, an item type that is never
+--- equipped) — the caller keeps the item record id as the kind in that case.
+function effectKindProbe.resolveItemSlot(itemId)
+    if effectKindProbe.itemRecordOf(types.Weapon, itemId) then return 'carriedright' end
+    local keys = effectKindProbe.slotEnumKeys()
+    local record = effectKindProbe.itemRecordOf(types.Armor, itemId)
+    if record then
+        local armorType = record.type
+        if armorType ~= nil then return keys.armor[armorType] end
+        return nil
+    end
+    record = effectKindProbe.itemRecordOf(types.Clothing, itemId)
+    if record then
+        local clothingType = record.type
+        if clothingType ~= nil then return keys.clothing[clothingType] end
+    end
+    return nil
+end
 
-local boundSummonWatch = {}   -- [actorId] = { actor = handle, known = { [kindKey] = { castKey, seq } } }
-local displacementSeq = 0     -- monotonically increasing: higher seq = newer cast
-local DISPLACEMENT_SWEEP_INTERVAL = 0.2
-local nextDisplacementSweep = 0
+--- The kind key a bound item occupies: its equip slot, memoised per record id.
+function effectKindProbe.boundSlotKey(itemId)
+    if type(itemId) ~= 'string' or itemId == '' then return nil end
+    local cached = effectKindProbe.boundSlotKeyCache[itemId]
+    if cached ~= nil then
+        if cached == false then return nil end
+        return cached
+    end
+    local slotKey = effectKindProbe.resolveItemSlot(itemId)
+    effectKindProbe.boundSlotKeyCache[itemId] = slotKey or false
+    return slotKey
+end
 
---- Fold one normalised effect id into the kind keys it occupies on the
---- target: the spawned creature record for a summon, the equipped item
---- record ids for a bound effect, the effect id itself when the concrete
---- record is unknown (modded effects without a resolvable item).
-local function addDisplacementKindKeys(effKey, out)
+--- Fold one normalised effect id into the kind keys it occupies on a target:
+--- the creature record the engine spawns for a summon, the equipment slot a
+--- bound effect fills, the effect id itself when the concrete item (and so the
+--- slot) is unknown.
+---
+--- Bound kinds are SLOTS, not item records — that is the vanilla rule.  Every
+--- bound effect equips one item into one slot, so a whole set of bound
+--- equipment is eight or so active spells at once (cuirass, boots, helm,
+--- gauntlets, greaves, shield, weapon), while two spells that would fight over
+--- the same slot replace each other, exactly like the engine's own equip
+--- behavior.  A spell that equips two items (vanilla's Bound Gauntlets) holds
+--- both slot kinds.
+function effectKindProbe.addKindKeys(effKey, out)
     if type(effKey) ~= 'string' or effKey == '' then return end
     if isSummonEffectId(effKey) then
         -- The creature record the engine spawns is the kind: two different
@@ -2146,30 +2267,168 @@ local function addDisplacementKindKeys(effKey, out)
         end
         return
     end
-    local items = boundEffectItemIds(effKey)
+    local items = effectKindProbe.boundKindItems(effKey)
     if items then
-        for itemId in pairs(items) do
-            if itemId == WILDCARD_BOUND_KEY then
-                out[effKey] = true
-            else
-                out[tostring(itemId):lower()] = true
-            end
+        -- The item list is an array of item record ids (the vanilla table and
+        -- the magic effect's own item field both are).  Each one folds to the
+        -- slot it will be equipped into; an id whose record this build cannot
+        -- resolve keeps the item id as its kind, so it can never displace an
+        -- unrelated bound item.  Iterating the *values* is what keeps two
+        -- entries of the same list (vanilla's two gauntlets) apart — the
+        -- array indexes are not item ids.
+        for _, itemId in ipairs(items) do
+            local itemKey = tostring(itemId):lower()
+            out[effectKindProbe.boundSlotKey(itemKey) or itemKey] = true
         end
+        if items[WILDCARD_BOUND_KEY] then out[effKey] = true end
     end
 end
 
---- Kind keys an active-spell entry currently occupies on its host.
-local function activeEntryDisplacementKinds(inst)
-    local out = {}
-    local effIds = collectActiveEffectIds(inst, function(key)
-        return isSummonEffectId(key) or isBoundEffectId(key)
-    end)
-    if effIds then
-        for effKey in pairs(effIds) do
-            addDisplacementKindKeys(effKey, out)
+-- ============================================================
+-- [BOUND & SUMMON STATE WATCH] One summon per creature kind, one bound
+-- effect per equipment slot — newest cast wins, decided on state, not on a
+-- poll
+--
+-- Vanilla forbids stacking a bound/summon effect: its magnitude is forced
+-- to 1 and a new application REPLACES the older one — you cannot hold two
+-- of the same creature, or two bound items that would fight over the same
+-- equipment slot.  What vanilla *does* allow, and what the effect penalty
+-- must not take away, is a whole set of bound equipment at once: Bound
+-- Cuirass, Boots, Helm, Gauntlets, Shield and Longsword are six different
+-- spells in six different slots, and all of them can be active together.
+-- The engine only enforces the per-record half (a non-stackable recast
+-- replaces itself), so two DIFFERENT spells carrying the same Summon or
+-- BoundX effect — a vanilla spell and a quick-cast stand-in, two modded
+-- spells, a scroll and a spell — stay active side by side and produce two
+-- scamps / two bound daggers.
+--
+-- This closes the gap for every source at once.  A cast's summon/bound
+-- effects are folded to *kind keys*: the creature record id the engine
+-- spawns for a summon effect, and the equipment slot a bound effect fills
+-- ('carriedright' for any weapon, 'carriedleft' for a shield, and the armor
+-- or clothing slot for everything worn — resolved from the item record's own
+-- type, memoised per item id).  So two different effect ids that summon the
+-- same creature (a modded copy of a vanilla effect) displace each other, two
+-- bound items that want the same slot displace each other, and bound items in
+-- different slots — the whole set — coexist.  A bound effect whose item this
+-- build cannot resolve keeps its own effect id as the kind: it takes nothing
+-- from anyone and nobody takes from it.
+--
+-- What is different from the polled sweep this replaces: the watch knows
+-- which entries it has already seen, so a pass classifies *nothing* unless
+-- something appeared or ended, and the ARRIVAL of a new holder is what takes
+-- a kind away from the incumbent — there is no need to re-derive the whole
+-- picture to decide who is newer, because a cast the script never saw is
+-- still an entry the engine added since the last pass.  For an actor whose
+-- active spells did not change, a pass costs one field read per entry: no
+-- classification, no record lookup, no allocation, no writes.  That is the
+-- fix for the frame-rate collapse — the old sweep paid a record-store scan
+-- per effect per pass, for every entry of every loaded actor.
+--
+-- The engine does not tell a script when an actor's active spells change
+-- (the API has no handler for it), so a cheap periodic pass stays.  It is
+-- verification, not re-derivation: only a genuinely new entry is ever looked
+-- at, and that lookup is a hash hit for a record that has been seen before.
+-- Actors carrying bookkeeping from a cast this script made — a reduced
+-- stand-in, a quick-cast summon — are additionally verified on every frame,
+-- because the cast that can replace them arrives through the engine and
+-- windows like a same-spell recast have to close in the frame it lands.
+--
+-- Removing a whole active spell (never just one effect) is what keeps the
+-- engine's own summon/bound bookkeeping consistent, the same contract the
+-- reduced-cast registry relies on.
+-- ============================================================
+
+--- The watch state: the actor watches themselves plus the sweep clock, in one
+--- table for the same local-slot reason as effectKindProbe above.
+local summonWatch = {
+    actors = {},            -- [actorId] = { actorId, actor, count, seen, recordIds, kinds, armed }
+    nextSweep = 0,          -- simulation time of the next periodic pass
+    activeActorCount = nil, -- the active-actor count the watched set reflects
+    entryKeyCache = {},     -- [id string] = its canonical form (see canonicalId)
+}
+local DISPLACEMENT_SWEEP_INTERVAL = 0.2   -- periodic verification cadence (seconds)
+
+--- The canonical form of an id string, memoised.  The same per-cast ids and
+--- record ids are handed back to the watch on every pass, and activeSpellIdKey
+--- allocates two strings per call, so the sweep would otherwise allocate per
+--- entry per pass even when nothing changed.  The cache holds one entry per
+--- *distinct* id string (Lua interns them, so a repeat costs a hash hit), and
+--- goes with the watch when the world it describes does.
+function summonWatch.canonicalId(raw)
+    local cached = summonWatch.entryKeyCache[raw]
+    if cached == nil then
+        cached = activeSpellIdKey(raw)
+        summonWatch.entryKeyCache[raw] = cached
+    end
+    return cached
+end
+
+--- The entry key that identifies one active spell for as long as the watch
+--- has it: the engine's per-cast id when it exposes one, the record id
+--- otherwise (older engines), both in the canonical form every registry
+--- comparison in this file uses, so a recast can never be mistaken for the
+--- entry it replaced.
+function summonWatch.entryKey(inst, fallbackKey)
+    local raw = nil
+    if inst then
+        local castId = inst.activeSpellId
+        if type(castId) == 'string' and castId ~= '' then
+            raw = castId
+        else
+            local recordId = inst.id
+            if type(recordId) == 'string' and recordId ~= '' then raw = recordId end
         end
     end
-    return out
+    if not raw and type(fallbackKey) == 'string' and fallbackKey ~= '' then raw = fallbackKey end
+    if not raw then return nil end
+    return summonWatch.canonicalId(raw)
+end
+
+--- Watch one actor, creating the watch on first sight.  The handle is kept
+--- fresh here so a watch never holds a stale object.  Callers that already
+--- hold the actor's id (the reduced-cast registry is keyed by it) pass it in:
+--- the watch is then found without building an id string, which is what makes
+--- the per-frame pass for a standing quick-cast free of allocations.
+ensureActorSpellWatch = function(actor, actorId)
+    if not (actor and actor:isValid()) then return nil end
+    actorId = actorId or tostring(actor.id)
+    local watch = summonWatch.actors[actorId]
+    if watch and watch.actor == actor then return watch end
+    if not watch then
+        watch = {
+            actorId = actorId,
+            actor = actor,
+            count = -1,      -- forces the first pass to build the picture
+            seen = {},       -- entry keys already classified
+            kinds = {},      -- kindKey -> the cast that currently holds it
+        }
+        summonWatch.actors[actorId] = watch
+    end
+    watch.actor = actor
+    return watch
+end
+
+--- The kind keys an active-spell entry currently occupies on its host: the
+--- creature the engine spawns for each Summon effect, the item records each
+--- BoundX effect equips.  Read from the entry's own effect list when the
+--- engine exposes it (that is the truth about what *this* cast applied), and
+--- from the record otherwise.  Empty when it holds no summon/bound kind.
+local function activeEntryDisplacementKinds(inst)
+    local kindKeys = nil
+    local effectIds, readable = effectKindProbe.readEntryEffectIds(inst, function(key)
+        return isSummonEffectId(key) or effectKindProbe.boundKindItems(key) ~= nil
+    end)
+    if not readable then
+        effectIds = effectKindProbe.recordEffectIds(inst and inst.id)
+    end
+    if effectIds then
+        for effKey in pairs(effectIds) do
+            if not kindKeys then kindKeys = {} end
+            effectKindProbe.addKindKeys(effKey, kindKeys)
+        end
+    end
+    return kindKeys or effectKindProbe.EMPTY_KIND_SET
 end
 
 --- Kind keys a source spell record carries for the effect indexes a cast
@@ -2179,45 +2438,20 @@ local function sourceSpellDisplacementKinds(spell, effectIndexes)
     for _, idx in ipairs(effectIndexes or {}) do
         local rawEff = spell and spell.effects and spell.effects[idx + 1]
         if rawEff then
-            local effKey = tostring(effectFieldValue(rawEff, "id") or ""):lower():gsub("[^%a%d]", "")
-            addDisplacementKindKeys(effKey, out)
+            local effKey = effectKindProbe.normaliseEffectId(effectFieldValue(rawEff, "id"))
+            if effKey then effectKindProbe.addKindKeys(effKey, out) end
         end
     end
     return out
-end
-
-local function sharesAnyKind(a, b)
-    if not (a and b) then return false end
-    for kindKey in pairs(a) do
-        if b[kindKey] then return true end
-    end
-    return false
-end
-
---- Remember which cast currently holds each of `kinds` for `actor`, so the
---- polled sweep recognises it as the incumbent instead of a challenger.
-local function noteDisplacementWinner(actor, activeSpellId, kinds)
-    if not (actor and actor:isValid()) then return end
-    local castKey = activeSpellId and activeSpellIdKey(activeSpellId) or nil
-    if not castKey then return end
-    local actorId = tostring(actor.id)
-    local watch = boundSummonWatch[actorId]
-    if not watch then
-        watch = { actor = actor, known = {} }
-        boundSummonWatch[actorId] = watch
-    end
-    watch.actor = actor
-    for kindKey in pairs(kinds) do
-        displacementSeq = displacementSeq + 1
-        watch.known[kindKey] = { castKey = castKey, seq = displacementSeq }
-    end
 end
 
 --- Retroactive replacement at apply time: `appliedActiveSpellId` is the cast
 --- that just landed; every OTHER active spell on the target that shares one
 --- of its summon/bound kind keys is an older application of the same kind
 --- and is removed (newest wins).  Called right after activeSpells:add, when
---- the losing entries are still the only same-kind entries in the list.
+--- the losing entries are still the only same-kind entries in the list, and
+--- it ends by arming the target's watch so the next pass re-registers what
+--- is left instead of re-deriving it here.
 local function displaceOlderBoundSummonSpells(active, target, appliedActiveSpellId, kinds)
     if not (active and type(active.remove) == 'function') then return end
     if type(kinds) ~= 'table' or next(kinds) == nil then return end
@@ -2225,10 +2459,10 @@ local function displaceOlderBoundSummonSpells(active, target, appliedActiveSpell
     local appliedKey = appliedActiveSpellId and activeSpellIdKey(appliedActiveSpellId) or nil
     -- Without the per-cast id `activeSpells:add` returns there is no way to
     -- tell the cast that just landed from the older ones — removing the
-    -- wrong side would kill the fresh cast.  The polled sweep covers those
-    -- engines instead, from its seen-this-frame ordering.
+    -- wrong side would kill the fresh cast.  The watch covers those engines
+    -- instead, from its own arrival order.
     if not appliedKey then return end
-    local losers = {}
+    local losers = nil
     for _, inst in pairs(active) do
         local isApplied = false
         local instCastKey = inst and inst.activeSpellId
@@ -2242,391 +2476,266 @@ local function displaceOlderBoundSummonSpells(active, target, appliedActiveSpell
         if inst and inst.fromEquipment then
             isApplied = true
         end
-        if not isApplied and inst then
+        if not isApplied and inst and inst.activeSpellId then
             local otherKinds = activeEntryDisplacementKinds(inst)
-            if sharesAnyKind(kinds, otherKinds) and inst.activeSpellId then
-                losers[#losers + 1] = {
-                    activeSpellId = inst.activeSpellId,
-                    label = tostring(inst.id or inst.activeSpellId),
-                }
+            for kindKey in pairs(otherKinds) do
+                if kinds[kindKey] then
+                    if not losers then losers = {} end
+                    losers[#losers + 1] = {
+                        activeSpellId = inst.activeSpellId,
+                        label = tostring(inst.id or inst.activeSpellId),
+                        kindKey = kindKey,
+                    }
+                    break
+                end
             end
         end
     end
-    for _, loser in ipairs(losers) do
-        active:remove(loser.activeSpellId)
-        debugLog(string.format(
-            'Bound/summon displacement: newer cast %s replaced older %s on %s',
-            tostring(appliedKey or '?'), loser.label, tostring(target.recordId or target.id)))
-    end
-    if appliedKey then
-        noteDisplacementWinner(target, appliedActiveSpellId, kinds)
-    end
-end
-
---- The polled half of the displacement rule: enforces one active spell per
---- summon/bound kind on every loaded actor, newest cast wins, for casts
---- that never pass through applySpellToActor (vanilla player casts, NPC
---- spells, scrolls).  See the block comment above for the bookkeeping.
-local function sweepBoundSummonDisplacement(now)
-    if now < nextDisplacementSweep then return end
-    nextDisplacementSweep = now + DISPLACEMENT_SWEEP_INTERVAL
-
-    local targets = {}
-    local function addTarget(actor)
-        if actor and actor.isValid and actor:isValid()
-            and types.Actor and types.Actor.objectIsInstance(actor) then
-            targets[tostring(actor.id)] = actor
+    if losers then
+        for _, loser in ipairs(losers) do
+            active:remove(loser.activeSpellId)
+            debugLog(string.format(
+                'Bound/summon displacement: newer cast %s replaced older %s on %s (%s)',
+                tostring(appliedKey), loser.label,
+                tostring(target.recordId or target.id), tostring(loser.kindKey)))
         end
     end
-    for _, player in ipairs(world.players or {}) do addTarget(player) end
+    local watch = ensureActorSpellWatch(target)
+    if watch then watch.armed = true end
+end
+
+--- One pass over one actor's active spells.  The first loop is what an
+--- unchanged actor costs: ask the engine for the list, count the entries and
+--- look for keys the watch has never seen — nothing is classified and nothing
+--- is allocated.  Only a change (an entry appeared, an entry ended) pays for
+--- the second loop, and even then only the arrivals are classified.
+local function scanActorSpells(watch)
+    local actor = watch.actor
+    local active = actor and actor:isValid() and types.Actor.activeSpells(actor) or nil
+    watch.armed = nil
+    if not active then return false end
+
+    local count, freshCount = 0, 0
+    for key, inst in pairs(active) do
+        if inst and not inst.fromEquipment then
+            count = count + 1
+            local entryKey = summonWatch.entryKey(inst, key)
+            if entryKey and not watch.seen[entryKey] then freshCount = freshCount + 1 end
+        end
+    end
+    if freshCount == 0 and count == watch.count then return false end
+
+    -- Something appeared or ended: rebuild the picture.  `seen` becomes the
+    -- new set of entry keys, `recordIds` maps every record id on the actor to
+    -- the per-cast id that carries it (the lookup the reduced-cast registry
+    -- needs), and every entry the watch had not seen is an arrival.
+    local seen = {}
+    local recordIds = {}
+    local fresh = nil
+    for key, inst in pairs(active) do
+        if inst and not inst.fromEquipment then
+            local entryKey = summonWatch.entryKey(inst, key)
+            if entryKey then
+                seen[entryKey] = true
+                local recordId = inst.id
+                if type(recordId) == 'string' and recordId ~= '' then
+                    recordIds[summonWatch.canonicalId(recordId)] = inst.activeSpellId or true
+                end
+                if not watch.seen[entryKey] then
+                    if not fresh then fresh = {} end
+                    fresh[#fresh + 1] = {
+                        key = entryKey,
+                        inst = inst,
+                        recordKey = type(recordId) == 'string' and recordId ~= ''
+                            and summonWatch.canonicalId(recordId) or nil,
+                    }
+                end
+            end
+        end
+    end
+
+    -- ── Reduced-cast bookkeeping, before the kind race ─────────────────────
+    -- The engine applying the source spell under its own record id is the one
+    -- thing its own stacking rule cannot see (the stand-in is a generated
+    -- record, so the two spells look unrelated to it).  It is decided here, on
+    -- the picture just rebuilt — no extra walk of the active list — and the
+    -- stand-in is taken out of the race below: the cast that replaced it is the
+    -- one that must hold the kind, not the stand-in fighting back for it.
+    local suppressed = nil
+    local byActor = reducedCastRegistry[watch.actorId]
+    if byActor then
+        for generatedKey, entry in pairs(byActor) do
+            local oursActive = recordIds[entry.generatedKey]
+            local sourceActive = (entry.sourceKey ~= entry.generatedKey)
+                and recordIds[entry.sourceKey] or nil
+            if sourceActive then
+                if not suppressed then suppressed = {} end
+                suppressed[entry.generatedKey] = true
+                if oursActive and oursActive ~= true and type(active.remove) == 'function' then
+                    active:remove(oursActive)
+                end
+                byActor[generatedKey] = nil
+                debugLog(string.format(
+                    'Effect penalty: reduced %s replaced by a full-strength cast of %s',
+                    tostring(entry.generatedId), tostring(entry.sourceId)))
+            elseif not oursActive then
+                -- The stand-in is gone (expired or dispelled): nothing to keep.
+                byActor[generatedKey] = nil
+                debugLog(string.format(
+                    'Effect penalty: reduced %s is no longer active on %s',
+                    tostring(entry.generatedId), tostring(entry.targetId)))
+            end
+        end
+        if next(byActor) == nil then reducedCastRegistry[watch.actorId] = nil end
+    end
+
+    -- An arrival takes the kind it occupies from whoever holds it: the holder
+    -- is an older application of the same creature/item kind, and removing its
+    -- active spell is what makes the engine disband its creature or take back
+    -- its item.
+    local kinds = watch.kinds
+    local losers = nil
+    if fresh then
+        for _, item in ipairs(fresh) do
+            -- A stand-in whose source spell is already standing is not a
+            -- challenger for anything: it has just been discarded above.
+            local suppressedStandIn = suppressed and item.recordKey
+                and suppressed[item.recordKey]
+            if not suppressedStandIn then
+                for kindKey in pairs(activeEntryDisplacementKinds(item.inst)) do
+                    local incumbent = kinds[kindKey]
+                    if incumbent and incumbent.entryKey ~= item.key and incumbent.activeSpellId then
+                        if not losers then losers = {} end
+                        losers[#losers + 1] = {
+                            activeSpellId = incumbent.activeSpellId,
+                            label = tostring(incumbent.castKey or '?'),
+                            kindKey = kindKey,
+                            winnerKey = item.key,
+                        }
+                    end
+                    kinds[kindKey] = {
+                        castKey = item.key,
+                        entryKey = item.key,
+                        activeSpellId = item.inst.activeSpellId,
+                    }
+                end
+            end
+        end
+    end
+
+    -- Kinds whose holder is no longer on the actor are free again: the next
+    -- cast to claim one wins trivially (the spell expired or was dispelled).
+    for kindKey, incumbent in pairs(kinds) do
+        if not seen[incumbent.entryKey] then kinds[kindKey] = nil end
+    end
+
+    watch.seen = seen
+    watch.recordIds = recordIds
+    watch.count = count
+
+    if losers and type(active.remove) == 'function' then
+        for _, loser in ipairs(losers) do
+            active:remove(loser.activeSpellId)
+            debugLog(string.format(
+                'Bound/summon displacement: %s holds %s on %s; older cast %s removed',
+                tostring(loser.winnerKey), tostring(loser.kindKey),
+                tostring(actor.recordId or actor.id), tostring(loser.label)))
+        end
+    end
+
+    return true
+end
+
+--- Bring the watched set in line with what is loaded.  Only run when that set
+--- can have changed — the active-actor count moved, or a cell change or a
+--- load dropped the watch — so the sweep no longer pays an id string per
+--- actor per tick the way the polled version did.
+local function refreshWatchedActors()
+    local activeCount = world.activeActors and #world.activeActors or nil
+    if summonWatch.activeActorCount ~= nil and activeCount ~= nil
+        and activeCount == summonWatch.activeActorCount then
+        return
+    end
+    summonWatch.activeActorCount = activeCount
+
+    local live = nil
+    local function watchActor(actor)
+        if not (actor and types.Actor and types.Actor.objectIsInstance(actor)) then return end
+        if live then live[tostring(actor.id)] = true end
+        ensureActorSpellWatch(actor)
+    end
+
     if world.activeActors then
-        for _, actor in ipairs(world.activeActors) do addTarget(actor) end
+        live = {}
+        for _, player in ipairs(world.players or {}) do watchActor(player) end
+        for _, actor in ipairs(world.activeActors) do watchActor(actor) end
+        for actorId, watch in pairs(summonWatch.actors) do
+            local actor = watch.actor
+            if not (actor and actor:isValid()) then
+                summonWatch.actors[actorId] = nil
+            elseif not live[actorId] and not reducedCastRegistry[actorId] then
+                -- Out of the loaded set (left the cell): nothing to police
+                -- until it is loaded again, and its handles may be gone by
+                -- then.  A watch that carries bookkeeping stays.
+                summonWatch.actors[actorId] = nil
+            end
+        end
     else
-        -- Older engines without world.activeActors: at least keep watching
-        -- the actors the other registries already know about.
-        for _, entry in pairs(reducedCastRegistry) do addTarget(entry.target) end
-        for _, entry in pairs(unpenalizedSummonRegistry) do addTarget(entry.target) end
-        for _, entry in pairs(reducedBoundItems) do addTarget(entry.actor) end
-    end
-
-    for actorId, actor in pairs(targets) do
-        local active = types.Actor.activeSpells(actor)
-        if not active then
-            boundSummonWatch[actorId] = nil
-        else
-            -- present[kindKey] = { { castKey = ..., activeSpellId = ... }, ... }
-            local present = {}
-            for _, inst in pairs(active) do
-                -- Constant-effect enchantments are not applications of the
-                -- kind: the engine re-adds them every mechanics tick while
-                -- the item is worn, so they can neither be displaced nor
-                -- displace (removing one only guarantees a respawn loop).
-                if not (inst and inst.fromEquipment) then
-                    local kinds = activeEntryDisplacementKinds(inst)
-                    if next(kinds) then
-                        local castKey = (inst.activeSpellId or inst.id)
-                            and activeSpellIdKey(inst.activeSpellId or inst.id) or nil
-                        for kindKey in pairs(kinds) do
-                            local list = present[kindKey]
-                            if not list then
-                                list = {}
-                                present[kindKey] = list
-                            end
-                            list[#list + 1] = { castKey = castKey, activeSpellId = inst.activeSpellId }
-                        end
-                    end
-                end
-            end
-            if next(present) then
-                local watch = boundSummonWatch[actorId] or { actor = actor, known = {} }
-                watch.actor = actor
-                local losers = {}
-                for kindKey, holders in pairs(present) do
-                    -- Sequence continuity: the cast already known to hold this
-                    -- kind keeps its sequence number; anything else is a cast
-                    -- that arrived since the last pass, i.e. the newest.
-                    local known = watch.known[kindKey]
-                    local winner, winnerSeq
-                    for _, holder in ipairs(holders) do
-                        local seq
-                        if known and known.castKey == holder.castKey then
-                            seq = known.seq
-                        else
-                            displacementSeq = displacementSeq + 1
-                            seq = displacementSeq
-                        end
-                        if not winner or seq > winnerSeq then
-                            winner, winnerSeq = holder, seq
-                        end
-                    end
-                    for _, holder in ipairs(holders) do
-                        if holder ~= winner and winner and winner.activeSpellId
-                            and holder.activeSpellId then
-                            losers[#losers + 1] = {
-                                activeSpellId = holder.activeSpellId,
-                                winnerLabel = tostring(winner.castKey),
-                                kindKey = kindKey,
-                            }
-                        end
-                    end
-                    watch.known[kindKey] = { castKey = winner.castKey, seq = winnerSeq }
-                end
-                -- Kinds no longer present drop out of the watch (the spell
-                -- expired or was dispelled; a later reappearance is a new
-                -- cast and wins trivially).
-                for kindKey in pairs(watch.known) do
-                    if not present[kindKey] then watch.known[kindKey] = nil end
-                end
-                for _, loser in ipairs(losers) do
-                    if type(active.remove) == 'function' then
-                        active:remove(loser.activeSpellId)
-                        debugLog(string.format(
-                            'Bound/summon displacement: %s holds %s on %s; older cast removed',
-                            loser.winnerLabel, loser.kindKey,
-                            tostring(actor.recordId or actor.id)))
-                    end
-                end
-                if next(watch.known) then
-                    boundSummonWatch[actorId] = watch
-                else
-                    boundSummonWatch[actorId] = nil
-                end
-            else
-                boundSummonWatch[actorId] = nil
-            end
-        end
-    end
-
-    -- Watches whose actor is no longer tracked (left the cell, died and was
-    -- cleaned up) have nothing to police.
-    for actorId in pairs(boundSummonWatch) do
-        if not targets[actorId] then boundSummonWatch[actorId] = nil end
+        -- Older engines without world.activeActors: keep watching the actors
+        -- the other registries already know about, plus the players.
+        for _, player in ipairs(world.players or {}) do watchActor(player) end
     end
 end
 
---- Remember a quick-cast summon that was applied at FULL strength (no effect
---- penalty or exempt): it lives under the source spell's own record id, so it
---- can stack with a later vanilla summon exactly like the reported bug.  The
---- next vanilla active spell whose summon effect overlaps it wins and this
---- entry's summon is purged, matching quick-cast-over-vanilla in the reverse
---- order.  `activeSpellId` is the per-cast id `activeSpells:add` returned —
---- the engine's own unique id for this exact cast — so "ours" is found by id,
---- not by matching the source record.
-local function registerUnpenalizedSummon(target, sourceId, activeSpellId, summonEffects)
-    if not (target and target:isValid()) then return end
-    if type(sourceId) ~= 'string' or sourceId == '' then return end
-    local effectSet = {}
-    if type(summonEffects) == 'table' then
-        for effId in pairs(summonEffects) do
-            effectSet[effId] = true
-        end
-    end
-    if not next(effectSet) then return end
-    local sourceKey = activeSpellIdKey(sourceId)
-    unpenalizedSummonRegistry[tostring(target.id) .. '|' .. tostring(sourceKey)] = {
-        target = target,
-        sourceKey = sourceKey,
-        activeSpellId = activeSpellId,
-        summonEffects = effectSet,
-        lastSweep = core.getSimulationTime(),
-    }
+--- Drop what the watch knows about actors.  The set of loaded actors is only
+--- trusted while the player stays in one cell and between loads; the first
+--- pass after this re-registers whatever is standing — the same one-pass cost
+--- the old sweep paid on every single pass.
+local function resetSummonStateWatch()
+    summonWatch.actors = {}
+    summonWatch.entryKeyCache = {}
+    summonWatch.activeActorCount = nil
+    summonWatch.nextSweep = 0
 end
 
---- Every UNPENALIZED_SUMMON_INTERVAL seconds, look for a vanilla active spell on
---- each registered target whose summon effect overlaps the quick-cast summon's;
---- the first one found wins and the quick-cast summon is purged by its own
---- active-spell id.  The engine removes the matching summoned creature when the
---- active spell carrying its summon effect is purged, so removing exactly the
---- quick-cast summon leaves the vanilla one standing — mirrors the shorthand
---- "quick-cast over a vanilla summon disbands it" in the order this registry
---- exists to police.  An entry's summon is no longer identifiable once its
---- active spell expired (or was dispelled); that also simply wins the exchange,
---- which is the vanilla rule, so nothing is done then.
-local function sweepUnpenalizedSummons()
-    local now = core.getSimulationTime()
-    for key, entry in pairs(unpenalizedSummonRegistry) do
-        local target = entry.target
-        if not (target and target:isValid()) then
-            unpenalizedSummonRegistry[key] = nil
-        elseif now - (entry.lastSweep or now) < UNPENALIZED_SUMMON_INTERVAL then
-            -- not this entry's turn yet
-        elseif now - (entry.lastSweep or now) > UNPENALIZED_SUMMON_EXPIRY then
-            -- long past any summon duration; stop polling this cast
-            unpenalizedSummonRegistry[key] = nil
-        else
-            entry.lastSweep = now
-            local active = types.Actor.activeSpells(target)
-            if not active then
-                unpenalizedSummonRegistry[key] = nil
-            else
-                local ours = nil
-                local rival = nil
-                local rivalReason = nil
-                local ownedKey = entry.activeSpellId
-                    and activeSpellIdKey(entry.activeSpellId)
-                for _, inst in pairs(active) do
-                    local isOurs = ownedKey and inst and inst.activeSpellId
-                        and activeSpellIdKey(inst.activeSpellId) == ownedKey
-                    -- Older engines may not return an id from activeSpells:add;
-                    -- fall back to matching the source record id for our cast.
-                    if not ownedKey and inst and inst.id
-                        and activeSpellIdKey(inst.id) == entry.sourceKey then
-                        isOurs = true
-                    end
-                    if isOurs then
-                        ours = inst
-                    else
-                        -- A vanilla summon can replace ours in two ways, same
-                        -- as sweepReducedCasts: same spell recast at full
-                        -- strength, or a different spell with overlapping
-                        -- summon effect. The effect list may be unavailable
-                        -- on some engine versions, so sameSpell is a fallback
-                        -- that must not be gated on collectActiveSummonEffects.
-                        local idKey = activeSpellIdKey(inst and inst.id or '')
-                        local sameSpell = idKey == entry.sourceKey
-                        local fx = collectActiveSummonEffects(inst)
-                        if sameSpell or (fx and summonEffectsOverlap(entry.summonEffects, fx)) then
-                            -- Keep first rival, but continue scanning so ours
-                            -- is still found even if pairs() visited rival first.
-                            if not rival then
-                                rival = inst
-                                rivalReason = sameSpell and 'same spell' or 'overlapping effect'
-                            end
-                        end
-                    end
-                end
-                if rival and ours and ours.activeSpellId
-                    and type(active.remove) == 'function' then
-                    active:remove(ours.activeSpellId)
-                    debugLog(string.format(
-                        'Effect penalty: quick-cast summon %s disbanded by a later vanilla summon %s (%s)',
-                        tostring(entry.sourceKey),
-                        tostring(rival.id or rival.activeSpellId or '?'),
-                        tostring(rivalReason)))
-                    unpenalizedSummonRegistry[key] = nil
-                elseif not ours then
-                    -- our summon already expired/dispelled; nothing to keep
-                    unpenalizedSummonRegistry[key] = nil
-                end
-            end
-        end
+--- The periodic verification pass: every watched actor is asked whether
+--- anything new is standing on it, and an actor this script has bookkeeping
+--- on is asked on every frame (see sweepReducedCasts, which runs the same
+--- pass for the actors in the reduced-cast registry).
+local function sweepBoundSummonDisplacement(now)
+    local due = now >= summonWatch.nextSweep
+    if due then
+        summonWatch.nextSweep = now + DISPLACEMENT_SWEEP_INTERVAL
+        refreshWatchedActors()
+    end
+    for _, watch in pairs(summonWatch.actors) do
+        if due or watch.armed then scanActorSpells(watch) end
     end
 end
 
---- Drop our reduced stand-in once the engine adds the spell it replaces, and
---- forget entries whose stand-in is no longer active anyway.
----
---- For a quick-cast *summon* this sweep additionally enforces the vanilla
---- single-summon rule in the order the reduced-cast registry cannot see by
---- record id: the engine's summon bookkeeping is keyed by the magic *effect*
---- id (CreatureStats::getSummonedCreatureMap), so a vanilla summon cast while
---- our quick-cast summon is up lands as a *different* active spell carrying
---- the same Summon effect.  Summons must not stack unless the spell is marked
---- stackable, so the vanilla cast disbands the quick-cast summon exactly as a
---- quick-cast disbands a vanilla summon (removeSourceForReducedSpell).  Both
---- creatures briefly exist on the engine side while the cast queue drains;
---- removing the reduced stand-in here runs the engine's own cleanup for its
---- summon - the VFX, the creature, and its ledger entry.
+--- Bookkeeping for the casts this script applied.  The registry is only ever
+--- *walked* (one entry per live quick-cast stand-in); the actors that carry
+--- one get the state pass on this frame instead of at the next periodic tick,
+--- because the engine cast that replaces a stand-in is not something a script
+--- is told about and leaving it standing for up to a sweep interval would be
+--- visible in game.
 local function sweepReducedCasts()
-    for key, entry in pairs(reducedCastRegistry) do
-        local target = entry.target
-        if not (target and target:isValid()) then
-            reducedCastRegistry[key] = nil
-        else
-            local active = types.Actor.activeSpells(target)
-            if not active then
-                reducedCastRegistry[key] = nil
-            else
-                local ours = nil
-                local sourceCast = false
-                local seen = {}
-                local foreignSummon = nil   -- later full-strength summon displacing ours
-                local foreignReason = nil
-                for activeKey, inst in pairs(active) do
-                    local id = tostring((inst and inst.id) or activeKey or '')
-                    seen[#seen + 1] = id
-                    local idKey = activeSpellIdKey(id)
-                    -- A stand-in another quick-cast generated is never a rival.
-                    local foreign = not reducedGeneratedKeys[idKey]
-                    if idKey == entry.generatedKey then
-                        ours = inst
-                    elseif entry.summonGuard and not foreignSummon and foreign then
-                        -- Two ways a later full-strength summon takes the field
-                        -- away from our stand-in, and both have to be caught:
-                        --
-                        --   * the SAME spell recast normally — the one thing the
-                        --     engine CAN hand us is its record id, which is
-                        --     exactly the source id this stand-in stands in for
-                        --     (the generated stand-in can never equal it, so the
-                        --     match is unambiguous).  This is the vanilla recast
-                        --     the record-id check exists for: both casts summon
-                        --     creatures of the same record id, and without this
-                        --     the quick-cast summon simply stayed standing;
-                        --
-                        --   * a DIFFERENT spell carrying an overlapping summon
-                        --     effect — the engine keys summons by effect id, not
-                        --     by spell, so there is no record id connecting the
-                        --     two casts; the effect set is the only truth.
-                        --
-                        -- Neither test is gated on inst.temporary: some engines
-                        -- keep vanilla casts under the SpellStore flag rather
-                        -- than Temporary, and a build that gates on it silently
-                        -- never sees the cast it is supposed to disband.
-                        local sameSpell = idKey == entry.sourceKey
-                        local fx = collectActiveSummonEffects(inst)
-                        if sameSpell or (fx and summonEffectsOverlap(entry.summonEffects, fx)) then
-                            foreignSummon = inst
-                            foreignReason = sameSpell and 'the same spell recast at full strength'
-                                or 'another summon of the same effect'
-                        end
-                    elseif not entry.summonGuard and idKey == entry.sourceKey then
-                        -- Non-summon reduced casts still rely on the record-id
-                        -- match (there is no engine-side spawn to key by).
-                        sourceCast = true
-                    end
-                end
-
-                -- `ours` can be gone already (the engine replaced the
-                -- stand-in, or the effect expired between passes): removing a
-                -- spell that is not there is a no-op, not an error.
-                local function removeOurs()
-                    if ours and ours.activeSpellId
-                        and type(active.remove) == 'function' then
-                        active:remove(ours.activeSpellId)
-                    end
-                end
-
-                if foreignSummon then
-                    -- A later full-strength summon displaced ours (see the loop
-                    -- above): summons do not stack, so the vanilla cast
-                    -- disbands the quick-cast summon.  Removing the stand-in
-                    -- runs the engine's own summon cleanup — the creature, its
-                    -- VFX and its ledger entry — even when the vanilla cast
-                    -- already claimed the effect-id slot in that ledger.
-                    removeOurs()
-                    debugLog(string.format(
-                        'Effect penalty: quick-cast summon %s disbanded by %s (%s)',
-                        tostring(entry.generatedId),
-                        tostring(foreignSummon and (foreignSummon.id or foreignSummon.activeSpellId) or '?'),
-                        tostring(foreignReason)))
-                    reducedCastRegistry[key] = nil
-                elseif sourceCast then
-                    -- The exact same spell is active under its own record id (a
-                    -- full-strength vanilla recast, or the same spell quick-cast
-                    -- again unpenalized): the engine could never match that id
-                    -- to the generated stand-in, so the stand-in is removed here.
-                    -- For a summon this also runs the engine's summon cleanup;
-                    -- the vanilla cast's summon then stands alone, exactly as
-                    -- recasting a summon in vanilla replaces the old one.
-                    removeOurs()
-                    debugLog(string.format(
-                        'Effect penalty: reduced %s replaced by a full-strength cast of %s',
-                        tostring(entry.generatedId), tostring(entry.sourceId)))
-                    reducedCastRegistry[key] = nil
-                elseif not ours then
-                    -- The stand-in is gone (expired or dispelled); a foreign
-                    -- vanilla summon that shares its effect has simply won the
-                    -- replacement, which is the vanilla rule we are enforcing.
-                    debugLog(string.format(
-                        'Effect penalty: reduced %s is no longer active on %s (active: %s)',
-                        tostring(entry.generatedId), tostring(entry.targetId),
-                        table.concat(seen, ', ')))
-                    reducedCastRegistry[key] = nil
-                end
+    for actorId, byActor in pairs(reducedCastRegistry) do
+        local watch = nil
+        for generatedKey, entry in pairs(byActor) do
+            local target = entry.target
+            if not (target and target:isValid()) then
+                byActor[generatedKey] = nil
+            elseif not watch then
+                -- The registry is keyed by the actor id, so the watch is
+                -- found without building one — this runs every frame while a
+                -- stand-in of this script is standing.
+                watch = ensureActorSpellWatch(target, actorId)
+                if watch then scanActorSpells(watch) end
             end
         end
+        if next(byActor) == nil then reducedCastRegistry[actorId] = nil end
     end
-
-    -- ── Unpenalized quick-cast summons ─────────────────────────────────────
-    -- No penalty means no generated stand-in — ours *is* the source spell under
-    -- its own record id — so the sweep above never sees these casts.  They are
-    -- handled back-to-front here on the same summon-effect rule.  The engine
-    -- keeps the other summon alive whenever it is not the one whose active
-    -- spell is being removed, so every other summon of a matching effect on the
-    -- target is purged directly by its active spell id; this is the one case
-    -- where a vanilla spell is removed on behalf of a newer quick-cast, in
-    -- order to match how quick-cast-over-vanilla already behaves.
-    sweepUnpenalizedSummons()
 end
 
 local heightCache = {}
@@ -3130,29 +3239,6 @@ local function isFriendlyFireSpell(caster, target, effects)
     if not ffProtectionActive(target) then return false end
     return ffIsFriendlyPair(caster, target, ffFollowerList())
         and ffIsHarmful(effects)
-end
-
---- The normalised summon-effect ids from a spell's own model effect list
---- (letters only, lowercase).  Mirrors the SUMMON_EFFECT_GMST keys handed to
---- the penalised-spawn tracker below, so a quick-cast summon can be registered
---- with the same effect ids the reduced-cast sweep must match a foreign
---- vanilla summon against.
-local function collectSourceSpellSummonEffects(spell, effectIndexes)
-    local summonEffects = {}
-    if not (spell and type(spell.effects) == 'table') then return summonEffects end
-    local scan = effectIndexes
-    if not (type(scan) == 'table' and #scan > 0) then
-        scan = {}
-        for i = 1, #spell.effects do scan[#scan + 1] = i - 1 end
-    end
-    for _, idx in ipairs(scan) do
-        local rawEff = spell.effects[idx + 1]
-        local effId = tostring(rawEff and rawEff.id or ''):lower():gsub('[^%a%d]', '')
-        if SUMMON_EFFECT_GMST[effId] then
-            summonEffects[effId] = true
-        end
-    end
-    return summonEffects
 end
 
 -- The projectile ray already supports this caller-scoped exclusion list.
@@ -3784,27 +3870,14 @@ end
 
             -- Remember which source spell this reduced cast stands in for, so
             -- a later full-strength cast of the same spell replaces it (the
-            -- engine can only match its own record ids).  A quick-cast summon
-            -- is additionally registered with the summon effect ids it carries
-            -- so the reduced-cast sweep can also disband it when a *different*
-            -- vanilla summon (same effect, different spell) lands on top of it
-            -- — the engine's summon bookkeeping is keyed by effect id, not
-            -- spell id, which is why that order otherwise slips through.
+            -- engine can only match its own record ids).  The summon half of
+            -- that rule — a later vanilla summon of the same creature, whatever
+            -- spell carries it — belongs to the state watch: the stand-in holds
+            -- the creature kind it summons, and an arrival takes the kind from
+            -- it, which is what a full-strength quick-cast summon (no stand-in
+            -- to register) relies on too.
             if isPenalized and not isStackableSpell then
-                registerReducedCast(target, tostring(applicationId), tostring(sourceSpellId),
-                    collectSourceSpellSummonEffects(spell, effectIndexes))
-            elseif not isPenalized and not isStackableSpell then
-                -- A full-strength quick-cast summon has no generated stand-in,
-                -- so the reduced-cast sweep above cannot see it; register it
-                -- with the summon effect ids it carries instead and disband it
-                -- (by the active-spell id the add just returned) the moment a
-                -- later vanilla summon of the same effect lands on the target —
-                -- the reverse order of quick-cast-over-vanilla.
-                local summonEffects = collectSourceSpellSummonEffects(spell, effectIndexes)
-                if next(summonEffects) ~= nil then
-                    registerUnpenalizedSummon(target, tostring(sourceSpellId),
-                        appliedActiveSpellId, summonEffects)
-                end
+                registerReducedCast(target, tostring(applicationId), tostring(sourceSpellId))
             end
 
             local effCount = spell.effects and #spell.effects or 0
@@ -6076,6 +6149,11 @@ local function onUpdate(dt)
         if lastPlayerCell ~= currentCell then
             if lastPlayerCell ~= nil then
                 heightCache = {}
+                -- The loaded actor set changed with the cell: the summon/bound
+                -- watch is dropped and rebuilt lazily, so its first pass on the
+                -- new cell's actors costs what the old polled sweep paid every
+                -- tick.
+                resetSummonStateWatch()
                 debugLog("[CACHE] Cell changed. Wiping height cache.")
             end
             lastPlayerCell = currentCell
@@ -6515,7 +6593,14 @@ return {
     engineHandlers = {
         onUpdate = onUpdate,
         onSave = creationOwnership.save,
-        onLoad = creationOwnership.load,
+        onLoad = function(data)
+            creationOwnership.load(data)
+            -- A load can replace the record world these caches describe: drop
+            -- them (they rebuild lazily) and re-register the actors instead of
+            -- trusting a picture taken before the load.
+            effectKindProbe.clearRecordCaches()
+            resetSummonStateWatch()
+        end,
     },
     eventHandlers = {
         --- Inventory scroll/charge consumption from player scripts (must run globally).
