@@ -5717,8 +5717,13 @@ for gi, group in ipairs(schoolGroups) do
         -- Direct/programmatic launches do not pass through the player-side
         -- MagExp_CastStart presentation path. Play their resolved cast sound
         -- once per launchSpell call, never once per school-group projectile.
+        -- OSSC quick-casts already play their own cast sound on the 'start'
+        -- text key, so suppress the duplicate here (userData.OSSC is set by
+        -- OSSC). External OSSC casts (castSpellAtTarget) have no animation and
+        -- rely on this path for their audio, so keep them audible.
         if not castSoundPlayed
             and data.isFree == true
+            and not (data.userData and data.userData.OSSC and not data.userData.External)
             and type(castSound) == "string"
             and castSound ~= ""
             and attacker.enabled
