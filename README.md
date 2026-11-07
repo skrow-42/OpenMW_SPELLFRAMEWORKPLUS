@@ -4,13 +4,15 @@
 
 > [!NOTE]
 > **This is the copy bundled in `OSSC/SPELLFRAMEWORKPLUS/`** — the SFP 3.14
-> base **plus the OSSC-side changes 26–33** (world-pause-safe launching and
+> base **plus the OSSC-side changes 26–34** (world-pause-safe launching and
 > cast queueing, the OpenMW 0.51 player AoE damage fix, caller-scoped target
 > exclusions, creation-ownership cleanup, the curved `motionPath`
-> projectile system, and scroll-cast support under the effect penalty). OSSC
+> projectile system, scroll-cast support under the effect penalty, and
+> engine-parity explosions: per-effect blast radii, and a caster that is never
+> caught by its own blast). OSSC
 > ships only this copy and is tested against it; do not install a separate or
 > older Spell Framework Plus over it. The bundle changes are documented in
-> [§27 Side Changelog (26–33)](#27-side-changelog-2633)
+> [§27 Side Changelog (26–34)](#27-side-changelog-2634)
 > and live in detail in `../side-slowchu-sfp-changes/changes.txt`.
 
 ---
@@ -36,8 +38,8 @@ Call these from any **Global Script** using `local I = require('openmw.interface
 |:--|:--|
 | `launchSpell(data)` | Launch a spell. Returns the projectile object. |
 | `emitProjectileFromObject(data)` | Emit from a non-actor. Returns the projectile object. |
-| `applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObject, forcedEffects, unreflectable, casterLinked, userData, muteAudio, muteLight, continuousVfx, effectScale, sourceData)` | Apply directly to actor. `effectScale` is the quick-cast penalty to apply the spell with (optional, default no penalty). A penalised cast also reduces what the engine spawns for it: a summoned creature arrives with its health / magicka / fatigue / attributes / skills and equipped weapon and armor scaled and replaced, and a bound item is swapped for a reduced copy the moment it equips — damage and armor values, and the enchantment a bound item carries (its own reduced enchantment record), all cut by the penalty (the replacement is removed again when the spell ends, and while it lasts the replacement cannot be dropped out of the caster's inventory — a drop attempt lands back in the pack on the next frame, with a player notice). The enchantment reduction needs the runtime enchantment record API of OpenMW 0.51+; on older engines the twin keeps the template's enchantment and the log says so once. The swap itself is applied by the actor's own local script, because `types.Actor.setEquipment` is a self-only binding: the global sweep generates the reduced record, moves the instance into the actor's inventory and sends `MagExp_EquipReducedItem`, and only removes the full-strength original once the actor confirms with `MagExp_EquipReducedItemApplied`. Stat writes are a self-only binding in OpenMW (`AttributeStat.base`, `DynamicStat.base`/`.current`, `SkillStat.base` may only be written by a local script running on that actor), so a summon's stats are scaled by `magexp_actor_stats.lua` attached to it with `addScript(path, initData)`; the sweep keeps asking until the actor confirms with `MagExp_StatScaleApplied`. |
-| `detonateSpellAtPos(spellId, caster, pos, cell, item, forcedEffects, unreflectable, casterLinked, vfxOverride, impactSpeed, maxSpeed, areaVfxScale, excludeTarget, userData, muteAudio, muteLight, continuousVfx, effectScale, areaOverride)` | Trigger AoE blast. `effectScale` is the quick-cast penalty the cast was reduced with (optional, default no penalty); `areaOverride` is an already-resolved AoE area in feet (optional). Without an override the blast resolves the area from the record and scales it by `effectScale`, so a penalised blast is never wider than its reduced effects. |
+| `applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObject, forcedEffects, unreflectable, casterLinked, userData, muteAudio, muteLight, continuousVfx, effectScale, sourceData, rangeType)` | Apply directly to actor. `rangeType` (optional, `core.magic.RANGE.Self`/`Touch`/`Target`) is the range type of *this* application and reproduces the engine's `CastSpell::inflict` filter, so a Self-range effect reaches the bystanders of an area Self spell (Fire Burst) — omitted, the stricter legacy rule keeps Self-range effects off any target that is not the caster (§17). `effectScale` is the quick-cast penalty to apply the spell with (optional, default no penalty). A penalised cast also reduces what the engine spawns for it: a summoned creature arrives with its health / magicka / fatigue / attributes / skills and equipped weapon and armor scaled and replaced, and a bound item is swapped for a reduced copy the moment it equips — damage and armor values, and the enchantment a bound item carries (its own reduced enchantment record), all cut by the penalty (the replacement is removed again when the spell ends, and while it lasts the replacement cannot be dropped out of the caster's inventory — a drop attempt lands back in the pack on the next frame, with a player notice). The enchantment reduction needs the runtime enchantment record API of OpenMW 0.51+; on older engines the twin keeps the template's enchantment and the log says so once. The swap itself is applied by the actor's own local script, because `types.Actor.setEquipment` is a self-only binding: the global sweep generates the reduced record, moves the instance into the actor's inventory and sends `MagExp_EquipReducedItem`, and only removes the full-strength original once the actor confirms with `MagExp_EquipReducedItemApplied`. Stat writes are a self-only binding in OpenMW (`AttributeStat.base`, `DynamicStat.base`/`.current`, `SkillStat.base` may only be written by a local script running on that actor), so a summon's stats are scaled by `magexp_actor_stats.lua` attached to it with `addScript(path, initData)`; the sweep keeps asking until the actor confirms with `MagExp_StatScaleApplied`. |
+| `detonateSpellAtPos(spellId, caster, pos, cell, item, forcedEffects, unreflectable, casterLinked, vfxOverride, impactSpeed, maxSpeed, areaVfxScale, excludeTarget, userData, muteAudio, muteLight, continuousVfx, effectScale, areaOverride, includeCaster, rangeType)` | Trigger AoE blast. `effectScale` is the quick-cast penalty the cast was reduced with (optional, default no penalty). `areaOverride` is an already-resolved AoE area: **one number** in feet for a uniform radius across the blast's effects, or a **table** of per-index areas in feet (`{ [0] = 15, [1] = 5 }`) when the caller resolved each effect separately. Without an override the blast resolves each effect's area from the record and scales it by `effectScale`, so a penalised blast is never wider than its reduced effects — and, exactly like the engine, only an effect with an Area of its own explodes, each at its own radius (§17). The blast never reaches its own `caster` (engine parity) unless `includeCaster` is `true` — or `userData.includeCaster` is — and `excludeTarget` (the actor the cast hit directly) is skipped as before. `rangeType` (optional) is the range type of this explosion — which of the record's effects may land on an actor in the ring — and is inferred from the exploding effects when a caller leaves it out (§17). |
 | `addTargetFilter(fn)` | Register a global filter `fn(target) → bool` to veto hits. |
 | `registerLockableEffect(id)` | Register an effect ID to allow spells to interact with doors and containers. |
 | `registerUniversalEffect(id)`| Register an effect ID to allow Touch spells to interact with ANY game object (Statics, Activators, etc.) and emit a `MagExp_OnMagicHit` hook for it. |
@@ -186,12 +188,20 @@ SFP silenced, so you know when to award:
 ```lua
 -- in your GLOBAL script's eventHandlers
 MagExp_SkillProgressSkipped = function(data)
-    -- data: { actor, skillId, school, spellId, cost, isEnchant }
+    -- data: { actor, skillId, school, spellId, cost }
 end
 ```
 
 It fires only in the `none` mode; when SFP does the awarding itself, nothing is
-announced.
+announced. Which casts are announced follows the vanilla skill rules (the
+engine's `spellIncreasesSkill` / `CastSpell::cast(item)`): a plain spell without
+"Always Succeeds" raises its school skill, a CastOnUse ("Cast When Used") item
+raises `skillId = 'enchant'`, and abilities, powers, "Always Succeeds" spells
+and scrolls raise nothing and stay silent. `skillId == 'enchant'` is exactly a
+Cast-When-Used item use (there is no other way to raise Enchant), so no
+separate `isEnchant` flag is carried — award the "Cast When Used" exp when you
+see it. The `school` field is kept on every announcement, enchant casts
+included, for consumers other than skill progression.
 
 **2. `I.MagExp_Player.awardSkillProgress(skillId, options?)`** — apply the gain
 you computed. Callable from any **player** script, and deliberately *not* gated
@@ -238,7 +248,7 @@ All fields except the first four are optional.
 | **spellId** | `string` | Required | Spell record ID. |
 | **itemObject** | `Object` | `nil` | Source item (for enchantment logic). |
 | **casterLinked** | `boolean` | `false` | If true, hostile reactions are attributed to the `attacker`. |
-| **userData** | `table` | `nil` | Custom per-launch cookie. Returned in all events. May include `ignoreActorRecordIds` — a caller-scoped exclusion list of record IDs (see §25). |
+| **userData** | `table` | `nil` | Custom per-launch cookie. Returned in all events. May include `ignoreActorRecordIds` — a caller-scoped exclusion list of record IDs (see §25) — `passThroughBystanders = true` with `targetObject` to fly the bolt through every actor that is not its mark (see §25b), and `includeCaster = true` to let the cast's own explosions reach its caster (see §17). |
 | |
 | **Movement & Lifecycle** |
 | **startPos** | `Vector3` | Required | World position where the spell spawns. |
@@ -280,7 +290,8 @@ All fields except the first four are optional.
 | |
 | **Logic & Constraints** |
 | **spellType** | `number` | Auto | Routing: Self/Touch/Target. |
-| **area** | `number` | Auto | AoE radius in game units. |
+| **area** | `number` | Auto | One uniform AoE radius for the whole launch, in **feet** (the record's Area unit — `fAreaRadiusMult` × 22.1 turns it into world units at detonation). Omit it and each effect explodes at its own record Area instead (see §17); pass it to force one radius for every effect of the cast. |
+| **includeCaster** | `boolean` | `false` | Let this cast's own explosions hit the caster that produced them. Off by default for engine parity — a blast never reaches its own caster (§17) — so set it (or `userData.includeCaster = true`) only for a deliberately self-centred nova. |
 | **isFree** | `boolean` | `false` | Skip magicka cost check. |
 | **unreflectable** | `boolean` | `false` | Cannot be reflected. |
 | **nonRecastable** | `boolean` | `false` | Aborts if spell is already active on caster. |
@@ -909,7 +920,9 @@ SFP synchronizes exactly with the engine's internal magic constants and global s
 
 1. **Vanilla Constant (22.1 Units/Foot)**: The framework uses the standard Morrowind conversion of 22.1 game units per 1 foot of Area.
 2. **GMST Integration**: `fAreaRadiusMult` is queried directly. If you (or another mod) increase the global explosion size in the GMSTs, SFP's hit registration and visual scaling will automatically adapt to maintain parity.
-3. **Primary-Only Logic**: SFP strictly follows the vanilla engine's rule where Area and impact metadata are derived only from the **first effect** in a spell record. This ensures perfect rotational and logical parity with base game spells.
+3. **Per-Effect Area (`CastSpell::explodeSpell`)**: the engine walks a cast's effect list one effect at a time, and so does SFP. An effect whose own Area is 0 never splashes — it is applied only to whatever the cast hit directly (the touched actor, the bolt's impact target, the caster of a Self spell) — and an effect that does have an Area explodes at its **own** radius. An actor inside the blast therefore receives exactly the effects whose individual radius reaches it, so a Touch spell like *[1] Damage Health (area 0) + [2] Paralyze (area 15)* paralyzes the bystanders in the ring without spraying its single-target half at them. The widest exploding effect still drives the orb VFX, the explosion sound and the `area` published on `MagExp_OnMagicHit`; the per-actor `effectIndex` names the dominant effect that actor actually took. A caller that resolved one radius for the whole blast keeps that behaviour: a numeric `areaOverride` (or a launch `area`) is a uniform radius for every effect of that detonation, while a per-index table hands each effect its own.
+4. **The caster is never caught by its own explosion**: OpenMW's `CastSpell::explodeSpell` skips the caster — `if (applyPair.first == mCaster) continue;`, commented *"Vanilla-compatible behaviour of never applying the spell to the caster"* — right beside the primary target it already hit (`excludeTarget`). SFP does the same for every blast it resolves: Touch, Self and a bolt's terminal burst. It matters most for Touch casts, because that blast is centred on the touched actor and the caster is by definition within arm's reach of it — an area Paralyze quick-cast on touch used to paralyze the caster along with the target. Nothing else is lost by it: a Self-range area spell still reaches its caster through the direct application `launchSpell` makes next to the blast, and another actor's blast still hits the player (change 28). A cast that genuinely wants a self-centred nova opts back in with `includeCaster = true` on the launch or the detonation call, or with `userData.includeCaster = true` for the whole cast.
+5. **One range type per application (`CastSpell::inflict`)**: the engine applies an effect list to an actor one range at a time (`if (enam.mData.mRange != range) continue;`), and an explosion inherits the range type of the cast that produced it (`explodeSpell(effects, ignore, rangeType)` → `inflict(actor, effectsToApply, rangeType, true)`). A Self-range effect therefore **does** reach the bystanders in the ring of an area Self spell — that is exactly how Morrowind's Fire Burst (Self range, Area 15) damages everyone around the caster — and SFP now does the same: its Self / Touch / projectile detonations and direct applications pass the range type they were made with (`applySpellToActor`'s and `detonateSpellAtPos`'s new trailing `rangeType` argument). A caller that passes none keeps the older, stricter rule — Self-range effects stripped from any target that is not the caster — and a detonation of a mixed-range effect list infers nothing rather than guessing.
 
 ---
 
@@ -1298,6 +1311,51 @@ I.MagExp.launchSpell({
 
 ---
 
+## 25b. Pass-Through Bystanders (`userData.passThroughBystanders`)
+
+A bolt aimed at one actor can meet a different actor on the way — a friend of
+the caster, a second enemy, the player's own follower. Vanilla Morrowind lets
+the bolt fly through it; a physics projectile stops on it. Ask for the vanilla
+behaviour per launch by naming the actor the cast was aimed at:
+
+```lua
+userData = {
+    passThroughBystanders = true,
+    targetObject          = target,   -- the actor this launch is aimed at
+}
+```
+
+- The named `targetObject` is the **only** actor the bolt may stop on. Every
+  other actor is a bystander by definition, so it is dropped from the
+  collision rays exactly like a corpse: passed through, **not** affected, not
+  damaged, no hit broadcast. That is the difference to `piercing` (§7b), which
+  applies the spell to everybody crossed and cannot be bounded to stop at the
+  intended target.
+- No radius, no scan and no line-of-fire tolerance is involved. A bystander
+  standing shoulder to shoulder with the mark — the case a distance scan loses
+  first — is passed through just like one dead on the axis, and a mark that is
+  out of the bolt's corridor (a lead or an arced shot) simply lets the bolt
+  pass everybody.
+- The caster is never a pass-through target (it is already ignored).
+- **An area spell keeps the ordinary collision**: the flag is ignored when the
+  launch has `area > 0`, because a blast has to detonate where it lands.
+- Without a valid `targetObject` (or when you name the caster) the flag does
+  nothing: nothing distinguishes a bystander from the mark, so the plain
+  collision stands. `userData.ignoreActorRecordIds` (§25) remains the tool for
+  a launch that only has a position to aim at.
+- The mark may be any actor, the player included — an actor's hostile cast at
+  the player is the most common launch that needs this.
+- A launch that asks for this but names no usable mark keeps the plain
+  collision, and says so once in the debug log (`[MagExp Proj]
+  passThroughBystanders without a valid targetObject: ...`) instead of looking
+  like a setting that does nothing.
+- The bundled OSSC drives its **Projectiles Pass Through Bystanders** setting
+  with exactly this pair: ON = every actor except the one the Combat AI chose is
+  passed through, OFF = nothing is sent and the bolt behaves like any physics
+  projectile. See `../OSSC - Oblivion-Style Spell Casting/README.md`.
+
+---
+
 ## 26. World-Pause Behavior
 
 During a world pause (menus, map, loading screen) OpenMW still delivers
@@ -1354,7 +1412,7 @@ changes.
 
 ---
 
-## 27. Side Changelog (26–33)
+## 27. Side Changelog (26–34)
 
 Changes layered on the SFP 3.14 base by the OSSC maintainers. Full write-ups
 with problems, validation and boundaries: `../side-slowchu-sfp-changes/changes.txt`.
@@ -1369,7 +1427,8 @@ with problems, validation and boundaries: `../side-slowchu-sfp-changes/changes.t
 | 31 | — | **Isolated mushroom-family integration and test package** (`WandForge-Mushroom-Family-v1_8.zip`). Exercises the bundle's caller-scoped exclusions and entries 26–30; introduces no new required SFP API. |
 | 32 | 2026-09-21 | **Scroll casts under the effect penalty.** Enchanted casts now apply through the ITEM record id (never the enchantment id, which the engine cannot resolve), with the item identity folded to a record-id string before the scroll is consumed and every later handle read gated behind `isValid()`; stand-ins whose `active.item` is nil are matched by record identity; generated-record effect counts are read leniently; a cast with no resolvable item record falls back to an unpenalised generated clone instead of dying at `activeSpells:add`. OSSC's NPC/creature item quick-cast no longer pre-consumes scroll/charge (SFP's launch resource guard is the single consumer, mirroring the player path). `QuickCastEffectPenaltyScrollsExempt` semantics unchanged. See `../side-slowchu-sfp-changes/changes.txt` §32. |
 | 33 | 2026-09-21 | **Error-handling policy made explicit (documentation).** `pcall` is used for exactly one thing in the bundle: `pcall(require, ...)` when loading an optional companion module (Pure Lua Multi Mark's `PMM_renameDialog`/`PMM_markWindow`, Skill Uses Scaled's data module) — absence is expected and keeps the existing fallbacks (rename stubs, the window-load cancel path, "SUS will use its own fallback"). Everything else — engine calls, item-handle reads (change 32), the pause/queue guards — runs unguarded behind check-then-act preconditions (`isValid()`, `hasAnimation`, `dt <= 0`) so real errors surface. §26's stale "caught with `pcall`" claim about the queued cast/anchor operations is corrected. See `../side-slowchu-sfp-changes/changes.txt` §33. |
-
+| 34 | 2026-09-27 | **Engine-parity explosions: a caster is never caught by its own blast, each effect explodes at its own radius, and one range type per application.** Reported from in-game as "an area Paralyze — or Paralyze as the second component of a spell — quick-cast on touch paralyzes the player too". Change 28 correctly put the player into the AoE actor list, but `detonateSpellAtPos` only ever skipped `excludeTarget` (the actor the cast hit directly), never the caster — and a Touch blast is centred on the touched actor, so the caster is always inside its own ring. OpenMW's `CastSpell::explodeSpell` skips both ("Vanilla-compatible behaviour of never applying the spell to the caster"), and SFP now does too for all three detonation sites (Self, Touch, terminal bolt burst), with `includeCaster` / `userData.includeCaster` as the opt-in for a deliberate self-centred nova. The same walk also fixes the blast geometry: instead of one ring at the widest Area carrying every effect of the cast, each effect explodes only if its own Area is > 0 and at its own radius, so a zero-area component no longer splashes onto bystanders (`areaOverride` accepts a per-index table; a numeric one keeps the old uniform radius). The same pass makes an application carry **one range type**, the way `CastSpell::inflict` does: an area Self spell now splashes onto the actors in its ring (Morrowind's Fire Burst) instead of being stripped by the caster-identity heuristic, through the new trailing `rangeType` argument on `applySpellToActor` / `detonateSpellAtPos` (inferred for callers that pass none; a mixed-range list keeps the old strict rule). §17 rewritten. See `../side-slowchu-sfp-changes/changes.txt` §34. |
+| 35 | 2026-11-05 | **Bystanders are passed through by naming the mark, not by a scan.** `NPCProjectilesPassThroughBystanders` was reported as doing nothing: the mod that owned the setting asked a distance scan to find the actors in the way and sent their record ids as `userData.ignoreActorRecordIds`, so whenever the scan could not recognise an actor (standing beside the mark, sharing its record id, straight on the axis, out of the scan's ray) the launch carried nothing and the bolt died on the bystander. SFP now takes the answer from the launch itself: `userData.passThroughBystanders` + `userData.targetObject` make the projectile drop every actor that is not the named mark from its collision rays, with `area > 0` launches and launches without a mark keeping the plain collision. The record-id exclusion list is unchanged and still honoured. See §25b. |
 ---
 
 ### Credits

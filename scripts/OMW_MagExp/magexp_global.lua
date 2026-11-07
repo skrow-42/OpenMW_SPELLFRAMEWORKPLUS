@@ -58,38 +58,48 @@ end
 loadMagExpSettings()
 storage.globalSection('SettingsMagExp_General'):subscribe(async:callback(loadMagExpSettings))
 
-local activeVfxRegistry      = {}
-local projectileItemRegistry = {} -- [proj.id] = live item object, kept until projectile dies
-local casterLinkedSpells     = {} -- list of {caster, target, spellId} for casterLinked effects
-local customFilters          = {}
-local trackedEffectRegistry  = {}
-local cachedDynamicRecords   = {} -- [hash_key] = record_string_id
+-- ---- Global-script registries ----
+-- All of the global script's live registries in ONE table: a Lua chunk is a
+-- single function and may hold at most 200 active local variables (over that,
+-- OpenMW refuses to load the script at all), and every file-scope local also
+-- costs the big handlers an upvalue. New shared state belongs in MagExpState,
+-- not in a new `local`.
+local MagExpState = {
+    activeVfx              = {},
+    -- [proj.id] = live item object, kept until projectile dies
+    projectileItems        = {},
+    -- list of {caster, target, spellId} for casterLinked effects
+    casterLinkedSpells     = {},
+    customFilters          = {},
+    trackedEffects         = {},
+    -- [hash_key] = record_string_id
+    dynamicRecords         = {},
+    -- [FEATURE] continuousVFX Actor Registry - Track actors with continuous VFX
+    -- [actorId] = {actor, spellId, vfxTag, registrationTime}
+    continuousVfxActors    = {},
+    -- [FEATURE 6] Cross-mod charge key registry: [keyId] = isPressed function
+    -- Populated by player scripts via I.MagExp.registerChargeKey()
+    chargeKeys             = {},
+    --- Live projectile registry.
+    --- [proj.id] = { projectile, spellId, attacker, launchTime, maxSpeed }
+    --- Populated by launchSpell, removed on collision or expiry.
+    activeProjectiles      = {},
+    pendingProjectileMoves = {},
+    -- Only Lua data waits across a world pause; no native teleport is queued.
+    -- Ordinary move events remain visible to consumers once, at local simulation
+    -- time. Flushing their native placement must not rebroadcast warp callbacks.
+    pauseWork              = { moves = {}, anchors = {}, anchorIds = {},
+                               sounds = {}, lights = {}, casts = {} },
+}
 
--- [FEATURE] continuousVFX Actor Registry - Track actors with continuous VFX
-local continuousVfxActors    = {} -- [actorId] = {actor, spellId, vfxTag, registrationTime}
-
--- [FEATURE 6] Cross-mod charge key registry: [keyId] = isPressed function
--- Populated by player scripts via I.MagExp.registerChargeKey()
-local chargeKeyRegistry = {}
-
---- Live projectile registry.
---- [proj.id] = { projectile, spellId, attacker, launchTime, maxSpeed }
---- Populated by launchSpell, removed on collision or expiry.
-local activeSpellRegistry = {}
-local pendingProjectileMoves = {}
-
--- Only Lua data waits across a world pause; no native teleport is queued.
--- Ordinary move events remain visible to consumers once, at local simulation
--- time. Flushing their native placement must not rebroadcast warp callbacks.
-local pauseWork = { moves = {}, anchors = {}, anchorIds = {}, sounds = {}, lights = {}, casts = {} }
 local MAX_PAUSED_CAST_REQUESTS = 128
 
 local function queueAnchorMove(anchor, cell, position, projectile)
     if anchor and anchor:isValid() and position then
-        pauseWork.anchors[anchor.id] = { anchor = anchor, cell = cell, position = position, projectile = projectile }
+        MagExpState.pauseWork.anchors[anchor.id] = { anchor = anchor, cell = cell, position = position, projectile = projectile }
         if projectile then
-            local ids = pauseWork.anchorIds[projectile.id] or {}
-            pauseWork.anchorIds[projectile.id] = ids
+            local ids = MagExpState.pauseWork.anchorIds[projectile.id] or {}
+            MagExpState.pauseWork.anchorIds[projectile.id] = ids
             ids[anchor.id] = true
         end
     end
@@ -114,6 +124,41 @@ local function addScriptOnce(object, scriptPath)
     object:addScript(scriptPath)
     return true
 end
+
+-- The two scripts that can interpret the per-actor `AddVfx` event. SFP ships
+-- one (scripts/OMW_MagExp/magexp_actor_vfx.lua, a straight
+-- `anim.addVfx(self, model, options)` call); OSSC installs its own copy of the
+-- same protocol (scripts/ossc/ossc_actor_hit_vfx.lua, which adds the engine's
+-- own non-NPC vertical correction). They are interchangeable, but TWO of them
+-- on one actor would serve the same `AddVfx` twice and draw every static twice,
+-- so whichever is already attached always wins.
+local ACTOR_VFX_SCRIPT = 'scripts/OMW_MagExp/magexp_actor_vfx.lua'
+local OSSC_ACTOR_VFX_SCRIPT = 'scripts/ossc/ossc_actor_hit_vfx.lua'
+
+local function hasActorVfxHandler(object)
+    return object:hasScript(ACTOR_VFX_SCRIPT) or object:hasScript(OSSC_ACTOR_VFX_SCRIPT)
+end
+
+--- Give `target` something that can interpret `AddVfx`, unless it already has.
+---
+--- Vanilla attaches a spell's hit static to the affected actor's own animation
+--- (`CastSpell::playEffects` -> `anim->addEffect`), and it does so for EVERY
+--- actor the spell landed on -- the one the bolt struck, and every victim the
+--- blast reached. The actor can only receive it when a handler for the event is
+--- attached, which is what this guarantees.
+local function ensureActorVfxHandler(target)
+    if not (target and target.isValid and target:isValid()) then return false end
+    if target.type == types.Player then return true end
+    if hasActorVfxHandler(target) then return true end
+    local ok, err = addScriptOnce(target, ACTOR_VFX_SCRIPT)
+    if ok then
+        debugLog(string.format("[Script Attach] %s attached to %s",
+            ACTOR_VFX_SCRIPT, target.recordId or "unknown"))
+    else
+        debugLog("[Script Attach] Actor VFX script attach failed:", tostring(err))
+    end
+    return ok
+end
 local OFFENSE_TYPE_IDS = types.OFFENSE_TYPE_IDS or {
     Theft               = 0,
     Assault             = 1,
@@ -135,7 +180,7 @@ local function checkTarget(target)
     end
 
     -- Run custom filters from other mods
-    for _, filter in ipairs(customFilters) do
+    for _, filter in ipairs(MagExpState.customFilters) do
         if not filter(target) then return false end
     end
 
@@ -218,6 +263,24 @@ local function effectPenaltyExemptSpell(spellRec, isEnchantment)
     -- regular spells as well back then; scrolls are the only part honoured
     -- here).
     return s:get('QuickCastEffectPenaltyScrollsSpellsExempt') == true
+end
+
+--- Vanilla skill-progression gate, mirroring the engine's own
+--- `spellIncreasesSkill` (mwmechanics/spellutil.cpp): a cast raises
+--- Spellcast_Success only when it is a plain ST_Spell record without the
+--- "Always Succeeds" flag.  Powers, abilities, diseases/curses and
+--- always-succeed spells raise no skill in vanilla, so they must be fully
+--- silent here - no award and no MagExp_SkillProgressSkipped (the event
+--- tells a consumer to grant progress vanilla never would have granted).
+--- `spellRec` is a SPELL record only (an enchantment record's `type` is an
+--- EnchantmentType whose numbers overlap SpellType's, so enchanted-item
+--- casts must be routed by the caller instead).  A record without a type
+--- (a custom spell table) is treated as a regular spell.
+local function spellIncreasesSkillRecord(spellRec)
+    if not spellRec then return false end
+    if spellRec.alwaysSucceedFlag == true then return false end
+    if spellRec.type == nil then return true end
+    return spellRec.type == core.magic.SPELL_TYPE.Spell
 end
 
 --- Quick-cast / global-event payload may be a number or a serialized string key.
@@ -395,6 +458,7 @@ end
 
 local reducedSpellRecords = {}       -- [source-kind-scale] = generated Spell
 local reducedSpellIdsBySource = {}   -- [source-key][generated-id] = true
+local savedReducedRecordsByName = nil -- lazily indexed once from persisted spell records
 
 local function reducedSpellSourceKey(spell, isEnchantment)
     return tostring(spell.id or "") .. (isEnchantment and "|enchantment" or "|spell")
@@ -542,6 +606,54 @@ local function createReducedSpellRecord(spell, isEnchantment, scale)
     -- Absorbing it would turn that divergence into a cast that silently does
     -- nothing; letting it propagate surfaces it at the request boundary with
     -- its stack trace instead.
+    -- Generated records survive in the save. Rebuild this session's cache by
+    -- finding an exact prior clone before creating another record; otherwise
+    -- every load would append another identical reduced spell to the save.
+    local function matchesReducedRecord(candidate)
+        if not candidate or candidate.name ~= draft.name then return false end
+        local candidateEffects = candidate.effects
+        if not candidateEffects then return false end
+        local count = 0
+        for index, expected in ipairs(effects) do
+            local actual = candidateEffects[index]
+            if not actual then return false end
+            count = index
+            for _, field in ipairs({ 'id', 'range', 'duration', 'magnitudeMin',
+                    'magnitudeMax', 'area', 'affectedAttribute', 'affectedSkill' }) do
+                local want = expected[field]
+                local got = effectFieldValue(actual, field)
+                if want ~= got then return false end
+            end
+        end
+        return count == #effects and candidateEffects[count + 1] == nil
+    end
+    if savedReducedRecordsByName == nil then
+        savedReducedRecordsByName = {}
+        for _, savedRecord in pairs(core.magic.spells.records) do
+            local name = savedRecord and savedRecord.name
+            if type(name) == 'string' then
+                local bucket = savedReducedRecordsByName[name]
+                if not bucket then
+                    bucket = {}
+                    savedReducedRecordsByName[name] = bucket
+                end
+                bucket[#bucket + 1] = savedRecord
+            end
+        end
+    end
+    local namedRecords = savedReducedRecordsByName[draft.name] or {}
+    for _, candidate in ipairs(namedRecords) do
+        if matchesReducedRecord(candidate) then
+            reducedSpellRecords[cacheKey] = candidate
+            if candidate.id then
+                reducedSpellIdsBySource[sourceKey] = reducedSpellIdsBySource[sourceKey] or {}
+                reducedSpellIdsBySource[sourceKey][activeSpellIdKey(candidate.id)] = true
+            end
+            debugLog(string.format('Effect penalty: reused saved generated record %s', tostring(candidate.id)))
+            return candidate, sourceKey
+        end
+    end
+
     local recordDraft = core.magic.spells.createRecordDraft(draft)
     local record = world.createRecord(recordDraft)
     if not record then
@@ -575,6 +687,12 @@ local function createReducedSpellRecord(spell, isEnchantment, scale)
     end
 
     reducedSpellRecords[cacheKey] = record
+    local bucket = savedReducedRecordsByName[draft.name]
+    if not bucket then
+        bucket = {}
+        savedReducedRecordsByName[draft.name] = bucket
+    end
+    bucket[#bucket + 1] = record
     local id = record.id
     if id then
         if not reducedSpellIdsBySource[sourceKey] then
@@ -2741,6 +2859,53 @@ end
 local heightCache = {}
 local lastPlayerCell = nil
 
+-- ── Where a visual goes on an actor ───────────────────────────────────────
+-- The rise, above the actor's FEET, of the middle of its body: where the engine
+-- draws the hit of a spell and where it explodes a spell that landed on a body.
+--
+--   * `World::castSpell` sets the cast's `mHitPosition` to
+--     `target.position + 0.7 * (getHalfExtents(target).z * 2)` for ANY target it
+--     was given -- never to the target's feet -- and `explodeSpell` spawns the
+--     area static at that very point. So do `combat.cpp` for an enchanted
+--     weapon strike and `actiontrap.cpp` for a trapped door.
+--   * `Animation::addEffect` uses the same height to decide where an attached
+--     static sits.
+--
+-- The box a script can read is the CULL-SAFE one (`getBoundingBox` merges every
+-- drawable's `getInitialBound()`), so its HALF-SIZE is deliberately generous
+-- and can exceed half the actor's height -- using it as "the middle" put
+-- effects in the air above the body. Its CENTRE stays on the body (a symmetric
+-- margin does not move it), so that is what is measured here, capped by the
+-- half-size and kept inside a torso band.
+--
+-- The band is the one `magexp_actor_vfx.lua` (SF+'s attached-static handler) and
+-- OSSC's `ossc_body_anchor` use: an attached hit static and the explosion of the
+-- same spell are then drawn at the SAME point on the body, whichever path
+-- placed them.
+local BODY_MIDDLE_MIN, BODY_MIDDLE_MAX, BODY_MIDDLE_FALLBACK = 25, 80, 70
+
+local function actorMiddleRise(target, fallback)
+    fallback = fallback or BODY_MIDDLE_FALLBACK
+    if not (target and target:isValid()) then return fallback end
+    local bbox = target:getBoundingBox()
+    if not bbox then return fallback end
+    local half = bbox.halfSize and bbox.halfSize.z
+    local rise = (bbox.center and bbox.center.z and target.position)
+        and (bbox.center.z - target.position.z) or nil
+    if rise and half and half > 0 and rise > half then rise = half end
+    local z = rise or half or fallback
+    if z < BODY_MIDDLE_MIN then z = BODY_MIDDLE_MIN
+    elseif z > BODY_MIDDLE_MAX then z = BODY_MIDDLE_MAX end
+    return z
+end
+
+--- The point on an actor's body where both its hit static and the explosion of
+--- a spell that landed on it belong.
+local function actorMiddlePos(target, fallback)
+    if not (target and target.position) then return nil end
+    return target.position + util.vector3(0, 0, actorMiddleRise(target, fallback))
+end
+
 -- ============================================================
 -- [CONFIG] Spell Effect Stacking
 -- Modders can modify STACK_CONFIG via I.MagExp.STACK_CONFIG
@@ -2774,16 +2939,21 @@ local STACK_CONFIG = {
 -- [HELPERS] Data Enrichment for Events
 -- ============================================================
 
-local function awardSpellSkillProgress(caster, school, spellCost, isEnchant, spellId)
+-- skillId alone identifies the use: 'enchant' is exactly a CastWhenUsed
+-- ("Cast When Used") item use, every other id names the school skill the
+-- cast raises.  school is carried alongside it (also for enchant casts -
+-- consumers other than skill progression read it) but nothing here keys
+-- off it any more.
+local function awardSpellSkillProgress(caster, skillId, school, spellCost, spellId)
     if not caster or not caster:isValid() then return end
     if caster.type ~= types.Player then return end
-    if not school or school == "" then return end
+    if not skillId or skillId == "" then return end
 
     local cost = spellCost or 0
     caster:sendEvent('MagExp_AwardSkillProgress', {
+        skillId   = skillId,
         school    = school,
         cost      = cost,
-        isEnchant = isEnchant or false,
         spellId   = spellId,
     })
 end
@@ -2825,6 +2995,32 @@ local function spellEffectRangeIsSelf(r)
         return r == R.Self
     end
     return false
+end
+
+-- ── Effect rules: range matching and blast geometry ───────────────────────
+-- One file-scope table on purpose. A Lua chunk is a single function and may
+-- hold at most 200 active locals (tools/tests/lua_local_limit_check.lua keeps
+-- 20 of them free), so these shared helpers are fields of a table rather than
+-- five more main-chunk locals.
+local effectRules = {}
+
+--- True when an effect's recorded range is the range type of the application
+--- it is being offered to.  This is the engine's own filter in
+--- `CastSpell::inflict(target, effects, range)`:
+---
+---     if (enam.mData.mRange != range)
+---         continue;
+---
+--- so a Self-range effect belongs to a Self-range application even when the
+--- actor receiving it is not the caster — which is exactly what an area Self
+--- spell is (Morrowind's Fire Burst: Self range, Area 15, damages everyone in
+--- the ring).  A nil rangeType matches everything and leaves the caller's
+--- index list alone.
+function effectRules.rangeIs(r, rangeType)
+    if rangeType == nil then return true end
+    if rangeType == core.magic.RANGE.Self then return spellEffectRangeIsSelf(r) end
+    if spellEffectRangeIsSelf(r) then return false end
+    return r == rangeType
 end
 
 --- Pick which spell.effects entry represents this hit (effects[1] fails when Self is listed first).
@@ -2899,6 +3095,7 @@ local function fireMagicHitEvent(data)
         attacker     = data.attacker,
         target       = data.target,
         spellId      = data.spellId,
+        startPos     = data.startPos,
         hitPos       = data.hitPos,
         hitNormal    = data.hitNormal or util.vector3(0,0,1),
         successful   = true,
@@ -3053,6 +3250,76 @@ local function spawnProjectileImpactVfx(data, hitPos)
     return true
 end
 
+--- The AREA static each school draws, the mod's long-standing per-school
+--- explosion VFX. Used only as a FALLBACK for an effect whose own `areaStatic`
+--- names nothing the load order provides -- without it such an effect drew the
+--- generic default orb, while the actor it hit drew the school's HIT static, so
+--- a blast of any school looked like a hit flash (finding 48).
+local SCHOOL_AREA_STATIC = {
+    alteration  = "VFX_AlterationArea",
+    conjuration = "VFX_ConjureArea",
+    destruction = "VFX_DestructArea",
+    illusion    = "VFX_IllusionArea",
+    mysticism   = "VFX_MysticismArea",
+    restoration = "VFX_RestorationArea",
+}
+local SCHOOL_BY_INDEX = {
+    [0] = "alteration", [1] = "conjuration", [2] = "destruction",
+    [3] = "illusion", [4] = "mysticism", [5] = "restoration",
+}
+
+--- A magic effect's school as a lowercase name, whether the record carries it
+--- as a name or as the engine's numeric index.
+local function schoolKey(mgef)
+    local school = mgef and mgef.school
+    if type(school) == "string" then return school:lower() end
+    if type(school) == "number" then return SCHOOL_BY_INDEX[school] end
+    return nil
+end
+
+--- The AREA statics an effect's element suggests, most specific first. An
+--- element that ships no area static of its own simply misses the lookup.
+local function elementAreaStaticIds(mgef)
+    local n = ((mgef and mgef.name) or ""):lower()
+    local eid = tostring((mgef and mgef.id) or ""):lower()
+    local function has(word) return n:find(word, 1, true) or eid:find(word, 1, true) end
+    if has("fire") then return { "VFX_FireArea" } end
+    if has("frost") or has("cold") then return { "VFX_FrostArea" } end
+    if has("shock") or has("lightn") then return { "VFX_LightningArea", "VFX_ShockArea" } end
+    if has("poison") then return { "VFX_PoisonArea" } end
+    return {}
+end
+
+--- The static record a blast -- and an actor an exploding effect landed on --
+--- draws for one exploding effect.
+---
+--- The effect's own `areaStatic` first, exactly what `CastSpell::explodeSpell`
+--- picks (`effect->mArea`). When the record names none, or names one the load
+--- order does not provide, the effect's element then its school provide the
+--- area static (`VFX_FireArea`, `VFX_DestructArea`, ...), and `VFX_DefaultArea`
+--- is the last resort, so a blast can never end up with no orb at all.
+---
+--- A HIT static is never used at any step: that is the wrong effect entirely,
+--- and substituting one painted a hit flash where an explosion belongs -- the
+--- report this exists for.
+---@return table|nil record, string staticId
+local function resolveAreaStaticRecord(areaMgef)
+    local named = areaMgef and areaMgef.areaStatic
+    local ids = {}
+    if type(named) == "string" and named ~= "" then ids[#ids + 1] = named end
+    for _, id in ipairs(elementAreaStaticIds(areaMgef)) do ids[#ids + 1] = id end
+    local school = schoolKey(areaMgef)
+    if school and SCHOOL_AREA_STATIC[school] then
+        ids[#ids + 1] = SCHOOL_AREA_STATIC[school]
+    end
+    ids[#ids + 1] = "VFX_DefaultArea"
+    for _, staticId in ipairs(ids) do
+        local rec = staticOrWeaponRecord(staticId)
+        if rec and rec.model and rec.model ~= "" then return rec, staticId end
+    end
+    return nil, tostring(named or "VFX_DefaultArea")
+end
+
 --- Fallback hit static record id when mgef.hitVfx is absent (ported from legacy manual apply VFX resolver).
 local function deriveMagicEffectImpactStaticId(mgef)
     if not mgef then return nil end
@@ -3089,65 +3356,6 @@ local function deriveMagicEffectImpactStaticId(mgef)
         if tostring(hitVfxId):find("Hit") then hitVfxId = "VFX_DefaultHit" end
     end
     return hitVfxId
-end
-
---- Fallback area static record id when mgef.areaStatic is absent.
-local function deriveMagicEffectImpactAreaId(mgef)
-    if not mgef then return nil end
-    
-    local schoolIdx = mgef.school
-    local s = "destruction"
-    if type(schoolIdx) == "string" then 
-        s = schoolIdx:lower()
-    elseif type(schoolIdx) == "number" then
-        local schools = { 
-            [0] = "alteration", 
-            [1] = "conjuration", 
-            [2] = "destruction", 
-            [3] = "illusion", 
-            [4] = "mysticism", 
-            [5] = "restoration" 
-        }
-        s = schools[schoolIdx] or "destruction"
-    end
-
-    local n = (mgef.name or ""):lower()
-    local eid = tostring(mgef.id):lower()
-    local element = nil
-    if n:find("fire") or eid:find("fire") then 
-        element = "Fire"
-    elseif n:find("frost") or eid:find("frost") or n:find("cold") or eid:find("cold") then 
-        element = "Frost"
-    elseif n:find("shock") or eid:find("shock") or n:find("lightn") then 
-        element = "Lightning"
-    elseif n:find("poison") or eid:find("poison") then 
-        element = "Poison"
-    end
-
-    local areaVfxId
-    if element then 
-        areaVfxId = "VFX_" .. element .. "Area"
-    elseif s == "destruction" then 
-        areaVfxId = "VFX_DestructArea"
-    elseif s == "alteration" then 
-        areaVfxId = "VFX_AlterationArea"
-    elseif s == "conjuration" then 
-        areaVfxId = "VFX_ConjureArea"
-    elseif s == "illusion" then 
-        areaVfxId = "VFX_IllusionArea"
-    elseif s == "mysticism" then 
-        areaVfxId = "VFX_MysticismArea"
-    elseif s == "restoration" then 
-        areaVfxId = "VFX_RestorationArea"
-    else 
-        areaVfxId = "VFX_DefaultArea" 
-    end
-
-    local lId = tostring(areaVfxId):lower()
-    if not (types.Static.records[lId] or types.Weapon.records[lId]) then
-        areaVfxId = "VFX_DefaultArea"
-    end
-    return areaVfxId
 end
 
 -- [FRIENDLIER FIRE COMPAT] Spells applied from Lua (activeSpells:add) bypass
@@ -3261,7 +3469,7 @@ local function userDataIgnoresActor(target, userData)
     return false
 end
 
-local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObject, forcedEffects, unreflectable, casterLinked, userData, muteAudio, muteLight, continuousVfx, effectScale, sourceData)
+local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObject, forcedEffects, unreflectable, casterLinked, userData, muteAudio, muteLight, continuousVfx, effectScale, sourceData, rangeType)
     if not target or not target:isValid() then return end
     if not (caster and caster:isValid()) then caster = target end
     if target.type ~= types.NPC and target.type ~= types.Creature and target.type ~= types.Player then
@@ -3354,13 +3562,34 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
         end
     end
 
+    -- ── Range gate (engine `CastSpell::inflict`) ──────────────────────────
+    -- The engine applies an effect list to one actor ONE RANGE TYPE at a time
+    -- (`if (enam.mData.mRange != range) continue;`), and the range type of an
+    -- explosion is the one the cast was made with — so a Self-range effect
+    -- does reach a bystander when the application itself is the Self-range
+    -- blast of an area Self spell (Morrowind's Fire Burst: Self range, Area
+    -- 15, damages everyone in the ring).  Callers that know the range type of
+    -- this application (SFP's own Self / Touch / projectile detonations and
+    -- partitions) pass it and get exactly that rule.
+    --
+    -- Without one — an external caller handing SFP a mixed index list for some
+    -- actor — the older, stricter heuristic stays: Self-range effects are
+    -- stripped from any target that is not the caster, so a mod applying a
+    -- whole spell to the actor it hit can never buff or heal that actor with
+    -- the caster's own half of the record.
     local sameCasterAsTarget = (caster and caster:isValid() and target and target:isValid() and caster.id == target.id)
     if effectIndexes and spell.effects and not sameCasterAsTarget then
         local filtered = {}
         for _, idx in ipairs(effectIndexes) do
             local eff = spell.effects[idx + 1]
-            if eff and not spellEffectRangeIsSelf(eff.range) then
-                table.insert(filtered, idx)
+            if eff then
+                if rangeType ~= nil then
+                    if effectRules.rangeIs(eff.range, rangeType) then
+                        table.insert(filtered, idx)
+                    end
+                elseif not spellEffectRangeIsSelf(eff.range) then
+                    table.insert(filtered, idx)
+                end
             end
         end
         effectIndexes = (#filtered > 0) and filtered or nil
@@ -3617,22 +3846,47 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
         and sourceData.hitModelExplicit == true
         and type(sourceData.hitModel) == "string"
         and sourceData.hitModel ~= ""
-    local suppressImpactVfx = (isAoe == true and hitPos ~= nil)
-        or (type(userData) == "table" and userData.suppressImpactVfx == true)
+    -- ── Who draws this hit's hit static? ──
+    --
+    -- `suppressImpactVfx` is a LISTENER's request: "do not attach the impact's
+    -- hit statics, I draw that impact myself". The impact a listener draws is
+    -- the one its own hit event reports -- the bolt's own target, the thing
+    -- that was struck. OSSC sets the flag on every launch it makes
+    -- (`ossc_impact_vfx.requestFor`) and draws that target from the event.
+    --
+    -- It is NOT an instruction about the COLLATERAL of the explosion. Vanilla
+    -- attaches a hit static to every actor the blast reached
+    -- (`explodeSpell` -> `inflict(victim, effects, rangeType, /*exploded*/true)`
+    -- -> `playEffects` -> `anim->addEffect(hitStatic)`), and a listener has no
+    -- per-victim drawing of its own to replace it with. Suppressing those -- the
+    -- flag used to cover `isAoe == true` as well -- left a blast that visibly
+    -- hurt a whole crowd with no feedback on a single one of them ("an area
+    -- spell that lands on the ground next to actors hits them, but no hit VFX
+    -- appears on them").
+    --
+    -- So the flag, and an explicit hit model (which is the DIRECT hit's), only
+    -- ever silence a non-AoE hit; this function's blast path is one call per
+    -- victim with `isAoe == true`, and `effectIndexes` already narrowed to the
+    -- effects whose own radius reached that victim. `wantActorHitVfx` below is
+    -- what the attach gates on.
+    local listenerSuppressesHitVfx =
+        (type(userData) == "table" and userData.suppressImpactVfx == true)
         or hasExplicitHitModel
+    local suppressImpactVfx = (not isAoe) and listenerSuppressesHitVfx
+    -- A blast victim always gets its flash: that is `playEffects`, per effect.
+    local wantActorHitVfx = (isAoe == true) or (not suppressImpactVfx)
     local function resolveSpawnPos()
         local vfxPos = hitPos
         if not vfxPos then
             local tStr = tostring(target.type)
             if tStr:find("NPC") or tStr:find("Creature") or tStr:find("Player") then
+                -- The actor's MIDDLE above its feet -- the value
+                -- `actorMiddleRise` measures, which is also where this spell
+                -- explodes when it lands on the body (see
+                -- `detonateSpellAtPos`). Measured once per actor.
                 local zOffset = heightCache[target.id]
                 if not zOffset then
-                    zOffset = 45
-                    local bbox = target:getBoundingBox()
-                    if bbox then
-                        zOffset = bbox.halfSize.z * 1.1
-                        if zOffset > 105 then zOffset = 65 end
-                    end
+                    zOffset = actorMiddleRise(target)
                     heightCache[target.id] = zOffset
                 end
                 vfxPos = target.position + util.vector3(0, 0, zOffset)
@@ -3659,25 +3913,42 @@ local function applySpellToActor(spellId, caster, target, hitPos, isAoe, itemObj
             local isPersistentLoop = isPersistentEffect and (rawEff.duration or 0) > 0
             local vfxTag = "MagExp_" .. tostring(spellId) .. "_" .. tostring(idx)
 
-            local staticId = (sourceData and sourceData.areaVfxRecId) or mgef.hitStatic
-            local hasAttachStatic = staticId and staticId ~= ""
-            local static = hasAttachStatic and types.Static.records[staticId] or nil
-            if static and static.model and target.enabled and not suppressImpactVfx then
-if isPersistentLoop then
-if not activeVfxRegistry[target.id] then activeVfxRegistry[target.id] = {} end
-activeVfxRegistry[target.id][vfxTag] = { target = target, spellId = appliedSpellId }
-
--- [OPTION A FIX] Attach the VFX handler script to non-player actors
-if target.type ~= types.Player then
-    debugLog(string.format("[Script Attach] Attempting to attach magexp_actor_vfx.lua to %s", target.recordId or "unknown"))
-    local ok, err = addScriptOnce(target, 'scripts/OMW_MagExp/magexp_actor_vfx.lua')
-    if ok then
-        debugLog("[Script Attach] Actor VFX script is attached")
-    else
-        debugLog("[Script Attach] Actor VFX script attach failed:", tostring(err))
-    end
-end
-end
+            -- What this body is shown: the effect's own HIT static.
+            --
+            -- Exactly what the engine does when it applies an effect
+            -- (`CastSpell::playEffects`): `magicEffect.mHit`, or
+            -- `VFX_DefaultHit` when the record names none -- for an effect with
+            -- an area and for one without, because the two visuals are separate
+            -- draws. The AREA static is never attached to a body:
+            --
+            --   * it belongs to the explosion, which `detonateSpellAtPos`
+            --     spawns as a WORLD effect at the point the spell landed
+            --     (`explodeSpell` -> `spawnEffect`), and
+            --   * an attached static is placed for a mesh authored around the
+            --     128-unit hit-static reference height (see
+            --     ossc_actor_hit_vfx / magexp_actor_vfx), so an area mesh --
+            --     authored around its own origin -- landed at the actor's feet.
+            --
+            -- An exploding effect therefore draws BOTH: this hit static on the
+            -- body, and the area orb at the body's middle (finding 49) -- for the
+            -- actor the bolt struck AND for every actor the blast reached
+            -- (`explodeSpell` gives each of them the same `playEffects`), which
+            -- is why the attach below is gated on `wantActorHitVfx` and not on a
+            -- listener's `suppressImpactVfx`.
+            local staticId = (type(mgef.hitStatic) == "string" and mgef.hitStatic ~= "")
+                and mgef.hitStatic or "VFX_DefaultHit"
+            local static = staticOrWeaponRecord(staticId)
+            -- A static record whose model is "" is a deliberate "no mesh"
+            -- declaration (effects drawn another way, e.g. by BeamFX): spawn
+            -- nothing for it. "" is truthy in Lua, hence ~= "".
+            if static and static.model and static.model ~= "" and target.enabled and wantActorHitVfx then
+                -- The handler that places an attached static is attached to
+                -- this actor -- only when it has none yet.
+                ensureActorVfxHandler(target)
+                if isPersistentLoop then
+                    if not MagExpState.activeVfx[target.id] then MagExpState.activeVfx[target.id] = {} end
+                    MagExpState.activeVfx[target.id][vfxTag] = { target = target, spellId = appliedSpellId }
+                end
 
                 local vfxOptions = { mwMagicVfx = true }
                 if isPersistentLoop then
@@ -3711,17 +3982,23 @@ end
                 end
             end
 
-            if not suppressImpactVfx and not isAoe and not (hasAttachStatic and static and static.model) then
+            -- Last resort only: `VFX_DefaultHit` itself is missing from the
+            -- load order, so nothing could be attached above. Every other hit
+            -- is drawn by the attach, once, exactly like `playEffects`.
+            if not suppressImpactVfx and not isAoe and not static then
                 local hitVfxId = deriveMagicEffectImpactStaticId(mgef)
                 if hitVfxId then
                     local rid = tostring(hitVfxId):lower()
                     local rec = types.Static.records[rid] or types.Weapon.records[rid]
-                    if rec and rec.model then
-                        local opts = { mwMagicVfx = false }
-                        if target:isValid() and target.enabled then
-                            opts.attachToObject = target
-                        end
-                        world.vfx.spawn(rec.model, resolveSpawnPos(), opts)
+                    if rec and rec.model and rec.model ~= "" then
+                        -- `attachToObject` is not an option that
+                        -- openmw.world.vfx.spawn accepts (it takes mwMagicVfx,
+                        -- particleTextureOverride, scale, vfxId, loop and
+                        -- useAmbientLight), so passing it did nothing. The
+                        -- static belongs at the point of impact anyway, which
+                        -- is what vanilla's explodeSpell does with
+                        -- spawnEffect(model, texture, mHitPosition, 1.0f).
+                        world.vfx.spawn(rec.model, resolveSpawnPos(), { mwMagicVfx = false })
                     end
                 end
             end
@@ -3777,7 +4054,13 @@ end
                 attacker      = caster,
                 target        = target,
                 spellId       = spellId,
-                hitPos        = hitPos or target.position,
+                startPos      = sourceData and sourceData.startPos,
+                -- resolveSpawnPos() is the point the spell actually landed:
+                -- the incoming hit position when the cast carried one, else
+                -- the actor's body. `target.position` is the ground under its
+                -- feet and must never stand in for a missing impact point --
+                -- every listener then drew its VFX on the ground.
+                hitPos        = resolveSpawnPos(),
                 spellType     = Rrng.Touch,
                 isAoE         = false,
                 area          = primaryArea,
@@ -3793,7 +4076,7 @@ end
                 attacker      = caster,
                 target        = target,
                 spellId       = spellId,
-                hitPos        = hitPos or target.position,
+                hitPos        = resolveSpawnPos(),
                 spellType     = Rrng.Self,
                 isAoE         = false,
                 area          = primaryArea,
@@ -3898,7 +4181,7 @@ end
                 boundExpected, boundSnapshot, boundDuration)
         end
 
-        if not trackedEffectRegistry[target] then trackedEffectRegistry[target] = {} end
+        if not MagExpState.trackedEffects[target] then MagExpState.trackedEffects[target] = {} end
         local trackingData = {
             caster    = caster,
             startTime = core.getSimulationTime(),
@@ -3928,16 +4211,16 @@ end
                 end
             end
         end
-        trackedEffectRegistry[target][spellId] = trackingData
+        MagExpState.trackedEffects[target][spellId] = trackingData
 
         if continuousVfx then
-            if not activeVfxRegistry[target.id] then activeVfxRegistry[target.id] = {} end
+            if not MagExpState.activeVfx[target.id] then MagExpState.activeVfx[target.id] = {} end
             local vfxTag = "MagExp_" .. spellId
-            activeVfxRegistry[target.id][vfxTag] = {
+            MagExpState.activeVfx[target.id][vfxTag] = {
                 target = target,
                 spellId = appliedSpellId,
             }
-            continuousVfxActors[target.id] = {
+            MagExpState.continuousVfxActors[target.id] = {
                 actor            = target,
                 spellId          = appliedSpellId,
                 vfxTag           = vfxTag,
@@ -3951,11 +4234,16 @@ end
             if castVfxId then
                 local rid = tostring(castVfxId):lower()
                 local rec = types.Static.records[rid] or types.Weapon.records[rid]
-                if rec and rec.model then
-                    world.vfx.spawn(rec.model, target.position, {
-                        attachToObject = target,
-                        mwMagicVfx    = false,
-                        tag           = vfxTag,
+                if rec and rec.model and rec.model ~= "" then
+                    -- `target.position` is the ground under the actor, and
+                    -- neither `attachToObject` (not an option) nor `tag` (not
+                    -- the removability field -- `vfxId` is) does anything, so
+                    -- this glow sat at the feet and the registry sweep below
+                    -- could never remove it. Put it on the body and give it
+                    -- the id the sweep removes.
+                    world.vfx.spawn(rec.model, resolveSpawnPos(), {
+                        mwMagicVfx = false,
+                        vfxId      = vfxTag,
                     })
                 end
             end
@@ -3964,7 +4252,7 @@ end
 
         if hasCasterLinked then
             debugLog("Tracking casterLinked spell", spellId, "on", target.recordId)
-            table.insert(casterLinkedSpells, { caster = caster, target = target, spellId = spellId })
+            table.insert(MagExpState.casterLinkedSpells, { caster = caster, target = target, spellId = spellId })
         end
     end
 end
@@ -3975,6 +4263,19 @@ local function getObjectCenter(obj)
     local bbox = obj:getBoundingBox()
     if bbox then
         local r = (bbox.halfSize.x + bbox.halfSize.y) / 2
+        local t = obj.type
+        if t == types.NPC or t == types.Creature or t == types.Player then
+            -- An ACTOR's middle, measured the way the hit VFX and the aim point
+            -- measure it: the rise from its feet to the box CENTRE, never the
+            -- cull-safe half-size (which is inflated and would lift a blast
+            -- above the body). A plain object keeps its own box centre.
+            local half = bbox.halfSize.z
+            local rise = (bbox.center and pos) and (bbox.center.z - pos.z) or nil
+            if rise and half and half > 0 and rise > half then rise = half end
+            local z = rise or half or 0
+            if z < 0 then z = 0 elseif z > 110 then z = 110 end
+            return util.vector3(bbox.center.x, bbox.center.y, pos.z + z), r
+        end
         return bbox.center, r
     end
     return pos, 0
@@ -4003,6 +4304,106 @@ local function dominantAreaEffectIndex(spell, idxList)
         if a > bestA then bestA = a; pick = ix end
     end
     return pick
+end
+
+--- One effect's area (feet) reduced by the quick-cast penalty, with the same
+--- rounding the generated record uses for every other value of the cast.
+function effectRules.scaledArea(eff, scale)
+    local area = (eff and type(eff.area) == "number") and eff.area or 0
+    if area <= 0 then return 0 end
+    if scale < 1 then area = math.floor(area * scale + 0.5) end
+    return math.max(0, area)
+end
+
+--- Per-effect resolved areas (feet) for one range partition of a cast, keyed
+--- by 0-based effect index, plus the widest of them.  An effect whose own area
+--- is 0 is absent from the table: the engine applies it to the primary target
+--- only and never lets it explode (see resolveBlastAreas).  launchSpell hands
+--- the table to the blast, so a penalised cast keeps each effect's own reduced
+--- radius instead of one shared, unreduced one.
+function effectRules.resolvedAreas(spell, idxList, effectScale)
+    local scale = coerceEffectScale(effectScale)
+    local out, maxArea = {}, 0
+    for _, ix in ipairs(idxList or {}) do
+        local area = effectRules.scaledArea(spell.effects and spell.effects[ix + 1], scale)
+        if area > 0 then
+            out[ix] = area
+            if area > maxArea then maxArea = area end
+        end
+    end
+    return out, maxArea
+end
+
+--- Resolve the geometry of one detonation: an ordered list of
+--- `{ index = <0-based effect index>, area = <feet> }` holding ONLY the effects
+--- that explode, plus the widest area among them.
+---
+--- Engine parity.  OpenMW's `CastSpell::explodeSpell` walks the effect list one
+--- effect at a time: an effect whose own area is 0 contributes nothing to the
+--- explosion (`inflict()` already applied it to the primary target), and every
+--- effect that does have an area collects its own actor list at its OWN radius
+--- (`getObjectsInRange(pos, area * unitsPerFoot)`).  An actor therefore receives
+--- exactly the effects whose individual radius reaches it — never the whole
+--- spell at the widest radius in the record.  That distinction is what keeps a
+--- touch spell like [1] Damage Health (area 0) + [2] Paralyze (area 15) from
+--- spraying its single-target half around the target.
+---
+--- `areaOverride` keeps its caller-facing meanings:
+---   * number → one already-resolved area in feet for every index of this blast
+---     (the legacy contract: a caller that resolved/scaled the area itself is
+---     never scaled twice);
+---   * table  → per-index resolved areas in feet, keyed by 0-based effect index
+---     (what launchSpell passes for its Self / Touch / projectile partitions);
+---   * nil    → resolve from the record here, reduced by `effectScale`.
+function effectRules.resolveBlast(spell, idxList, areaOverride, effectScale)
+    local uniform = (type(areaOverride) == "number") and math.max(0, areaOverride) or nil
+    local perIndex = (type(areaOverride) == "table") and areaOverride or nil
+    local scale = coerceEffectScale(effectScale)
+
+    local candidates = (type(idxList) == "table" and #idxList > 0) and idxList or nil
+    if not candidates then
+        candidates = {}
+        for i, _ in ipairs(spell.effects or {}) do candidates[i] = i - 1 end
+    end
+
+    local out, maxArea = {}, 0
+    for _, ix in ipairs(candidates) do
+        local area
+        if uniform then
+            area = uniform
+        elseif perIndex then
+            area = math.max(0, tonumber(perIndex[ix]) or 0)
+        else
+            area = effectRules.scaledArea(spell.effects and spell.effects[ix + 1], scale)
+        end
+        if area > 0 then
+            out[#out + 1] = { index = ix, area = area }
+            if area > maxArea then maxArea = area end
+        end
+    end
+    return out, maxArea
+end
+
+--- The range type one detonation carries.  The engine always explodes a single
+--- range type (`CastSpell::explodeSpell(effects, ignore, rangeType)` filters
+--- `effectInfo.mData.mRange != rangeType`), and SFP's own partitions do too, so
+--- the callers pass it explicitly.  For a caller that did not, infer it when
+--- every exploding effect agrees on one range — a mixed list keeps the older,
+--- caster-based gate in applySpellToActor instead of guessing.
+function effectRules.inferBlastRange(spell, idxList)
+    local resolved = nil
+    for _, ix in ipairs(idxList or {}) do
+        local eff = spell.effects and spell.effects[ix + 1]
+        if eff then
+            local r = spellEffectRangeIsSelf(eff.range) and core.magic.RANGE.Self or eff.range
+            if resolved == nil then
+                resolved = r
+            elseif resolved ~= r then
+                return nil
+            end
+        end
+    end
+    return resolved
 end
 
 --- Groups a list of 0-based effect indexes by their magic school.
@@ -4110,7 +4511,7 @@ local function handleDoorLockUnlock(spellId, caster, target, effectScale)
                 vfxPos = vfxPos or target.position
                 local rid = "VFX_AlterationHit"
                 local staticRecord = types.Static.records[rid] or types.Weapon.records[rid]
-                if staticRecord and staticRecord.model then
+                if staticRecord and staticRecord.model and staticRecord.model ~= "" then
                     core.sound.playSound3d("alteration hit", target)
                     world.vfx.spawn(staticRecord.model, vfxPos, { mwMagicVfx = false })
                     debugLog("[DOOR] Spawned Alteration Hit VFX")
@@ -4186,10 +4587,66 @@ local function handleDoorLockUnlock(spellId, caster, target, effectScale)
 
     return true
 end
+
+-- ── The actors the engine is actually rendering ──
+--
+-- `world.activeActors` is kept in step with the render scene by OpenMW
+-- (`ObjectLists::objectAddedToScene` / `objectRemovedFromScene`), so it is the
+-- set of actors that have a scene node -- and therefore an animation -- right
+-- now. An actor outside it is a reference the engine has PAGED OUT: no mesh, no
+-- animation, no physics.
+--
+-- This matters because a spell applied to an actor is drawn on it: the hit
+-- static goes out as `AddVfx`, and the actor's handler asks
+-- `anim.hasAnimation(self)` before adding it. That binding is
+-- `World::getAnimation(ptr)` -- the overload that CREATES: it pulls the
+-- reference back out of the paged set, rebuilds its whole humanoid animation
+-- set (parsing every `animations/xbase_anim/*.kf`, which is where the
+-- `addAnimSource: can't find bone '..._end'` warnings come from) and blacklists
+-- it from paging for the rest of the session. Asking a paged-out actor to show
+-- a flash therefore costs a full animation rebuild to draw something nobody can
+-- see.
+--
+-- Vanilla never gets there: `CastSpell::explodeSpell` filters its ring with
+-- `if (affected.getClass().isActor() && !world->isActorCollisionEnabled(affected))
+-- continue;`, whose comment says exactly why -- "Ignore actors without
+-- collisions here, otherwise it will be possible to hit actors outside
+-- processing range". A paged-out actor has no physics actor, so the engine can
+-- neither hit it nor show it anything.
+--
+-- Returns nil on an engine too old to expose the binding, which keeps the old
+-- behaviour instead of skipping every victim.
+local function sceneActorIds()
+    if not world.activeActors then return nil end
+    local ids = {}
+    for _, actor in ipairs(world.activeActors) do
+        if actor and actor:isValid() then ids[actor.id] = true end
+    end
+    return ids
+end
+
+--
+-- Also used by the projectile collision: a bolt's own target came out of a
+-- physics raycast, so it is always in the scene, but the ring a blast collects
+-- from `cell:getAll()` is not.
+--
+local function actorIsInScene(object, sceneActors)
+    if object == nil then return false end
+    -- No binding: cannot tell, so never drop anybody.
+    if sceneActors == nil then return true end
+    -- The player is always rendered and always has an animation.
+    if object.type == types.Player then return true end
+    return sceneActors[object.id] == true
+end
+
 -- ============================================================
 -- [AOE] Detonate spell at world position
+--
+-- The blast never reaches its own caster (engine parity, see the caster
+-- exclusion in the actor loop below) unless the call opts in with
+-- `includeCaster` — or the cast opts in with `userData.includeCaster = true`.
 -- ============================================================
-local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject, forcedEffects, unreflectable, casterLinked, vfxOverride, impactSpeed, maxSpeed, areaVfxScale, excludeTarget, userData, muteAudio, muteLight, continuousVfx, effectScale, areaOverride)
+local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject, forcedEffects, unreflectable, casterLinked, impactSpeed, maxSpeed, areaVfxScale, excludeTarget, userData, muteAudio, muteLight, continuousVfx, effectScale, areaOverride, includeCaster, rangeType)
     local spell = core.magic.spells.records[spellId] or core.magic.enchantments.records[spellId]
     if not spell and spellId then
         -- Safe iterative fallback for numerical proxies or case-sensitivity edge cases
@@ -4217,156 +4674,178 @@ local function detonateSpellAtPos(spellId, caster, pos, cell, itemObject, forced
     -- inside the unreduced radius while every hit landed at the reduced
     -- magnitude.  Callers that already resolved the area (launchSpell's
     -- self/touch paths and the projectile collision) hand it over as
-    -- areaOverride; anything else — including the public interface, which
-    -- does not know about the penalty — gets the record's area scaled here by
-    -- the same scale the effects were cloned with.
-    local maxArea = 0
+    -- areaOverride — as ONE number for a uniform radius, or as a per-index
+    -- table when they resolved each effect separately; anything else —
+    -- including the public interface, which does not know about the penalty —
+    -- gets the record's areas scaled here by the same scale the effects were
+    -- cloned with.  resolveBlastAreas keeps the per-effect rule the engine
+    -- uses: only an effect with an area of its own explodes, and it explodes
+    -- at its own radius.
     local AREA_MULT = (core.getGMST("fAreaRadiusMult") or 1.0) * 22.1
-    local hasAreaOverride = type(areaOverride) == "number"
+    local blastAreas, maxArea = effectRules.resolveBlast(spell, forcedEffects, areaOverride, effectScale)
+    if maxArea <= 0 or #blastAreas == 0 then return end
 
-    if hasAreaOverride then
-        maxArea = math.max(0, areaOverride)
-    elseif forcedEffects and #forcedEffects > 0 then
-        maxArea = maxAreaAmongIndexes(spell, forcedEffects)
-    elseif spell.effects and spell.effects[1] then
-        maxArea = (spell.effects[1] and spell.effects[1].area) or 0
-    end
-    local areaScale = coerceEffectScale(effectScale)
-    if not hasAreaOverride and areaScale < 1 and maxArea > 0 then
-        maxArea = math.max(0, math.floor(maxArea * areaScale + 0.5))
-    end
-    if maxArea <= 0 then return end
-
+    -- The widest exploding effect still drives the orb VFX, the explosion
+    -- sound and the blast radius the hit events report, exactly as the single
+    -- record-wide maximum did before.
     local finalRadius = maxArea * AREA_MULT
+    local blastIndexes = {}
+    for i, entry in ipairs(blastAreas) do
+        entry.radius = entry.area * AREA_MULT
+        blastIndexes[i] = entry.index
+    end
 
-    local areaVfxIx = dominantAreaEffectIndex(spell, forcedEffects)
+    -- The range type this explosion carries, which decides what may land on an
+    -- actor in the ring (engine `explodeSpell` → `inflict(actor,
+    -- effectsToApply, rangeType, true)`): SFP's own partitions pass it, an
+    -- external call gets it inferred when every exploding effect agrees.
+    local blastRangeType = (rangeType ~= nil) and rangeType
+        or effectRules.inferBlastRange(spell, blastIndexes)
+
+    local areaVfxIx = dominantAreaEffectIndex(spell, blastIndexes)
     local areaVfxEff = spell.effects and spell.effects[areaVfxIx + 1]
+    -- ── The blast visual: what CastSpell::explodeSpell spawns ──
+    -- OpenMW walks the cast's exploding effects and, for each one,
+    -- places that effect's OWN area static at the blast point, scaled by
+    -- `area * 2`:
+    --
+    --     world->spawnEffect(model, effect->mParticle, mHitPosition,
+    --                        effectInfo.mData.mArea * 2);
+    --
+    -- where `model` is `effect->mArea` -- the record's `areaStatic`.
+    -- When the record names none, or names one this load order does not
+    -- provide, `resolveAreaStaticRecord` narrows it down by the
+    -- effect's element and then its school (VFX_FireArea,
+    -- VFX_DestructArea, ...) and only then reaches `VFX_DefaultArea`,
+    -- so a blast of any school draws that school's explosion. A bolt's
+    -- own static is never substituted for the area one, and a HIT
+    -- static is never used at any step: a blast that showed a hit
+    -- static is a blast whose area VFX was never drawn at all.
+    --
+    -- The SPAWN CALL is deliberately the one this mod has always used
+    -- ({ scale = ..., mwMagicVfx = false }), not the engine's
+    -- texture-override form: handing the effect's `particle` to
+    -- `world.vfx.spawn` as `particleTextureOverride` re-textures every
+    -- texturing property of the orb mesh with that small particle
+    -- sprite, and the orb stops reading as an explosion at all. The
+    -- engine can pass the texture because it calls
+    -- `RenderingManager::spawnEffect`; `world.vfx.spawn` is not that
+    -- call, so the orb keeps its own authored look here.
+    -- WHERE the orb is drawn: the engine's `mHitPosition`.
+    --
+    -- A spell that landed ON AN ACTOR explodes at
+    -- `target.position + 0.7 * (getHalfExtents(target).z * 2)`
+    -- (`World::castSpell`) -- the middle of the body, never the
+    -- actor's feet and never above its head. That is also where the
+    -- victim's own hit static is attached, so the flash and the
+    -- explosion read as ONE visual on the body.
+    --
+    -- A spell that landed on the GROUND or on an object explodes at
+    -- the point it struck: the collision's own `hitPos`, untouched.
+    local vfxPos = pos
+    if excludeTarget and excludeTarget:isValid()
+        and types.Actor.objectIsInstance(excludeTarget) then
+        vfxPos = actorMiddlePos(excludeTarget) or pos
+    end
+
+    -- The explosion is NEVER suppressed. `suppressImpactVfx` is a
+    -- listener's "do not attach a hit static, I draw those myself"
+    -- request (OSSC sets it on every launch and then draws the hit
+    -- statics from its own event), and it used to gate this spawn as
+    -- well -- so every OSSC cast exploded into nothing at all. The two
+    -- visuals are independent: the flag concerns the statics attached
+    -- to the actors the blast reached, not the blast itself.
+    if world.vfx and world.vfx.spawn then
+        local drawn = 0
+        for _, entry in ipairs(blastAreas) do
+            local eff = spell.effects and spell.effects[entry.index + 1]
+            local areaMgef = eff and core.magic.effects.records[eff.id]
+            if areaMgef and entry.area > 0 then
+                local rec, staticId = resolveAreaStaticRecord(areaMgef)
+                if rec then
+                    -- `area * 2` is the engine's own scale for an area
+                    -- static; `areaVfxScale` stays available for a
+                    -- caller that overrides it deliberately.
+                    local scale = areaVfxScale or (entry.area * 2)
+                    debugLog(string.format(
+                        "[DETONATE] Area VFX %s at %s (area %d, scale %.2f)",
+                        tostring(rec.model), tostring(vfxPos), entry.area, scale))
+                    world.vfx.spawn(rec.model, vfxPos, {
+                        scale = scale,
+                        mwMagicVfx = false,
+                    })
+                    drawn = drawn + 1
+                else
+                    -- Loud on purpose: this is the only way a blast can
+                    -- still draw nothing, so it must never be silent.
+                    print("[MagExp] DETONATE: no area static for effect '"
+                        .. tostring(areaMgef.id) .. "' (tried "
+                        .. tostring(staticId) .. ") -- no explosion drawn")
+                end
+            end
+        end
+        -- Silent success, loud failure: a blast that drew nothing is the one
+        -- thing this file must never hide, because it is indistinguishable
+        -- in game from "the area VFX do not work".
+        if drawn == 0 then
+            print("[MagExp] DETONATE: nothing drawn for '" .. tostring(spellId)
+                .. "' (" .. tostring(#blastAreas) .. " exploding effect(s))")
+        end
+    else
+        -- No spawning API at all: say so once per blast rather than skip in
+        -- silence (a missing `world.vfx` looks exactly like a broken VFX).
+        print("[MagExp] DETONATE: world.vfx.spawn is unavailable; "
+            .. "no explosion can be drawn for '" .. tostring(spellId) .. "'")
+    end
+
     if areaVfxEff then
         local mgef = core.magic.effects.records[areaVfxEff.id]
+        -- The explosion SOUND comes from the widest exploding effect's record
+        -- (`explodeSpell`: `effect->mAreaSound`, else the school's
+        -- `<school> area`). A record this load order does not describe simply
+        -- has no sound: the blast VISUAL below is drawn from each exploding
+        -- effect's own record and never depends on this one, so a bad record
+        -- can neither hide nor silence the explosion.
+        local explosionSound
         if mgef then
-            local areaStaticId = vfxOverride
-            
-            -- [SFP LOGIC] If no specific area VFX was provided, try to detect from record
-            if not areaStaticId or areaStaticId == "" or areaStaticId == "VFX_DefaultArea" then
-                if mgef and mgef.areaStatic and mgef.areaStatic ~= "" then
-                    areaStaticId = mgef.areaStatic
-                else
-                    areaStaticId = "VFX_AREA_FALLBACK"
-                end
-            end
-            
-            -- [ELEMENTAL LOGIC] Select specialized area VFX based on effect name/id
-            local lowerId = tostring(areaStaticId):lower()
-            if lowerId:find("bolt") or lowerId == "vfx_area_fallback" or lowerId == "vfx_defaultarea" then
-                local schoolIdx = mgef and mgef.school or 2
-                local n = mgef and (mgef.name or ""):lower() or ""
-                local eid = mgef and tostring(mgef.id):lower() or ""
-                
-                -- 1. Determine school name 's'
-                local s = "destruction"
-                if type(schoolIdx) == "string" then s = schoolIdx:lower()
-                elseif type(schoolIdx) == "number" then
-                    local schools = { [0]="alteration", [1]="conjuration", [2]="destruction", [3]="illusion", [4]="mysticism", [5]="restoration" }
-                    s = schools[schoolIdx] or "destruction"
-                end
-                
-                -- 2. Detect Elemental Identity (regardless of school)
-                local n = (mgef.name or ""):lower()
-                local eid = tostring(mgef.id):lower()
-                local element = nil
-                if     n:find("fire")   or eid:find("fire")   then element = "Fire"
-                elseif n:find("frost")  or eid:find("frost")  or n:find("cold") or eid:find("cold") then element = "Frost"
-                elseif n:find("shock")  or eid:find("shock")  or n:find("lightn") then element = "Lightning"
-                elseif n:find("poison") or eid:find("poison") then element = "Poison"
-                end
-
-                -- 3. Resolve Area VFX based on Priority: Element > School > Default
-                if element then
-                    areaStaticId = "VFX_" .. element .. "Area"
-                else
-                    if s == "alteration" then areaStaticId = "VFX_AlterationArea"
-                    elseif s == "conjuration" then areaStaticId = "VFX_ConjureArea"
-                    elseif s == "illusion" then areaStaticId = "VFX_IllusionArea"
-                    elseif s == "mysticism" then areaStaticId = "VFX_MysticismArea"
-                    elseif s == "restoration" then areaStaticId = "VFX_RestorationArea"
-                    else areaStaticId = "VFX_DestructArea" end
-                end
-
-                -- [SFP FALLBACK] Progressive refinement to stay on-element
-                local lId = tostring(areaStaticId):lower()
-                if not (types.Static.records[lId] or types.Weapon.records[lId]) then
-                    debugLog("[DETONATE] Missing Area VFX:", tostring(areaStaticId), " -- checking Hit fallback")
-                    local hitId = areaStaticId:gsub("Area", "Hit")
-                    if types.Static.records[hitId:lower()] or types.Weapon.records[hitId:lower()] then
-                        areaStaticId = hitId
-                    else
-                        if not (types.Static.records[areaStaticId:lower()] or types.Weapon.records[areaStaticId:lower()]) then
-                            debugLog("[DETONATE] Missing Hit VFX:", tostring(areaStaticId), " -- falling back to generic Default")
-                            areaStaticId = "VFX_DefaultArea"
-                        end
-                    end
-                end
-                debugLog("[DETONATE] Final VFX candidate:", tostring(areaStaticId))
-
-                -- Final check: Ensure we don't spawn nothing
-                local finalId = areaStaticId:lower()
-                if not (types.Static.records[finalId] or types.Weapon.records[finalId]) then
-                    areaStaticId = "VFX_DefaultHit"
-                end
-            end
-
             local impactSound = type(userData) == "table" and userData.impactSound or nil
             local hasImpactSoundOverride = type(impactSound) == "string"
-            local explosionSound
             if hasImpactSoundOverride then
                 explosionSound = impactSound ~= "" and impactSound or nil
             else
                 explosionSound = mgef.areaSound ~= "" and mgef.areaSound
                     or (mgef.school and (mgef.school .. " area"))
             end
-            local suppressImpactVfx = type(userData) == "table"
-                and userData.suppressImpactVfx == true
-            if not suppressImpactVfx and world.vfx and world.vfx.spawn then
-                local rid = tostring(areaStaticId):lower()
-                local rec = types.Static.records[rid] or types.Weapon.records[rid]
-                if rec and rec.model then
-                    local scale = areaVfxScale or (finalRadius / 14.0 + 2.0)
-                    debugLog(string.format("[DETONATE] Spawning VFX: %s at %s (Scale: %.2f)", tostring(rec.model), tostring(pos), scale))
-                    world.vfx.spawn(rec.model, pos, { scale = scale, mwMagicVfx = false })
-                else
-                    debugLog("[DETONATE] ERROR: Missing or invalid model for static ID:", tostring(areaStaticId))
-                end
-            end
--- ✅ FIXED — replaces the broken playSound3d call at line 1163
-if explosionSound and not muteAudio then
-    local soundAnchor = nil
+        end
 
-    -- Search cell for the closest valid object to the blast position
-    if cell then
-        local bestDist = math.huge
-        for _, obj in ipairs(cell:getAll()) do
-            if obj:isValid() and obj.enabled then
-                local d = (obj.position - pos):length()
-                if d < bestDist then
-                    bestDist = d
-                    soundAnchor = obj
+    -- ✅ FIXED — replaces the broken playSound3d call at line 1163
+    if explosionSound and not muteAudio then
+        local soundAnchor = nil
+
+        -- Search cell for the closest valid object to the blast position
+        if cell then
+            local bestDist = math.huge
+            for _, obj in ipairs(cell:getAll()) do
+                if obj:isValid() and obj.enabled then
+                    local d = (obj.position - pos):length()
+                    if d < bestDist then
+                        bestDist = d
+                        soundAnchor = obj
+                    end
                 end
             end
         end
-    end
 
-    -- Last resort: caster (only if valid — avoids the nil crash)
-    if not soundAnchor and caster and caster:isValid() then
-        soundAnchor = caster
-    end
+        -- Last resort: caster (only if valid — avoids the nil crash)
+        if not soundAnchor and caster and caster:isValid() then
+            soundAnchor = caster
+        end
 
-    if soundAnchor then
-        core.sound.playSound3d(explosionSound, soundAnchor, { volume = 1.0 })
-    else
-        debugLog("[DETONATE] No valid sound anchor found for:", explosionSound)
-    end
-end
-        
+        if soundAnchor then
+            core.sound.playSound3d(explosionSound, soundAnchor, { volume = 1.0 })
+        else
+            debugLog("[DETONATE] No valid sound anchor found for:", explosionSound)
+        end
     end
 end
     local isLockUnlock = false
@@ -4381,6 +4860,29 @@ end
 
     if cell then
         local affectedCount = 0
+        -- Who the engine can actually reach (see sceneActorIds). Collected once
+        -- per detonation: the same set is queried for every reference in the
+        -- ring.
+        local sceneActors = sceneActorIds()
+        local skippedOutOfScene = 0
+        -- ── Caster exclusion (engine parity) ──────────────────────────────
+        -- OpenMW's CastSpell::explodeSpell never applies an explosion to the
+        -- caster that produced it — "Vanilla-compatible behaviour of never
+        -- applying the spell to the caster": `if (applyPair.first == mCaster)
+        -- continue;`, right beside the `ignore` (primary target) skip that
+        -- excludeTarget mirrors.  Without it a Touch cast is guaranteed to hit
+        -- its own caster: the blast is centred on the touched actor's torso and
+        -- the caster is, by definition, within arm's reach of it, so an area
+        -- Paralyze quick-cast on touch paralysed the caster along with the
+        -- target (and every zero-area component of the spell rode along with
+        -- it).  A Self-range area spell still reaches its caster through the
+        -- direct applySpellToActor call launchSpell makes next to the blast.
+        -- includeCaster (per call) or userData.includeCaster (per cast) opts
+        -- back in for a deliberately self-centred nova.
+        local casterHitsSelf = (includeCaster == true)
+            or (type(userData) == "table" and userData.includeCaster == true)
+        local casterId = (not casterHitsSelf and caster and caster:isValid()) and caster.id or nil
+
         -- OpenMW 0.51 keeps the player outside the ordinary cell reference list.
         -- Query Player explicitly, then deduplicate before applying any effects.
         -- Both lists belong to this cell; range and caller exclusions still apply.
@@ -4393,45 +4895,122 @@ end
                 end
             end
         end
+        local casterSkipped = false
+        -- ── A CHEAP SCREEN ON THE POSITION, BEFORE ANYTHING IS MEASURED ────
+        --
+        -- The ring is every reference the cell lists, and one blast must not
+        -- pay a bounding-box read for a reference hundreds of metres away --
+        -- let alone one the engine is not rendering. `getBoundingBox` is
+        -- `RenderingManager::getCullSafeBoundingBox`, which for a PAGED
+        -- reference (`!rootNode || worldScene->isPagedRef(ptr)`) builds a whole
+        -- scene node to answer: `getCorrectedModel`, the mesh template, and for
+        -- an NPC `new NpcAnimation(...)` -- `addAnimSource` over
+        -- `meshes/xbase_anim.nif` and every `animations/xbase_anim/*.kf` under
+        -- it. That is exactly the set of files that logs one
+        -- `addAnimSource: can't find bone '..._end'` warning per bone the
+        -- shipped kfs name and the skeleton lacks (finding 56).
+        --
+        -- `object.position` is free (`RefData::getPosition`), so it is what the
+        -- screen uses. The radius a reference's own body can widen the ring by
+        -- is bounded by ACTOR_RADIUS_SLACK (an actor's box is ~60 units across;
+        -- 128 is generous and cannot exclude a real victim), so one position
+        -- read decides who is even a candidate. Only candidates are measured,
+        -- and the measurement still decides the actual hit below -- this is a
+        -- screen, never the answer.
+        local BLAST_RADIUS_SLACK = 128
+        local screenRadius = finalRadius + BLAST_RADIUS_SLACK
+        local skippedOutOfRange = 0
         for _, object in ipairs(targets) do
             if object:isValid() then
-                local objPos, objRad = getObjectCenter(object)
-                objPos = objPos or object.position
-                local dist = nil
-                dist = (objPos - pos):length()
-                if dist and dist <= (finalRadius + objRad) and (not excludeTarget or object.id ~= excludeTarget.id) then
-                    local isLockable = (object.type == types.Door or object.type == types.Container)
-                    local isActor    = (object.type == types.NPC or object.type == types.Creature or object.type == types.Player)
+                local isLockable = (object.type == types.Door or object.type == types.Container)
+                local isActor    = (object.type == types.NPC or object.type == types.Creature or object.type == types.Player)
+                -- Out of the ring by the only read that costs nothing: passed
+                -- over unmeasured.
+                local appearsInRange = ((object.position - pos):length() <= screenRadius)
 
-                    if isLockUnlock and isLockable then
-                        handleDoorLockUnlock(spellId, caster, object, effectScale)
-                        affectedCount = affectedCount + 1
-                    elseif isActor and not isLockUnlock and not (types.Actor.objectIsInstance(object) and types.Actor.isDead(object))
-                        and not userDataIgnoresActor(object, userData) then
-                        applySpellToActor(spellId, caster, object, pos, true, itemObject, forcedEffects, unreflectable, casterLinked, userData, muteAudio, muteLight, continuousVfx, effectScale)
-                        -- Broadcast AoE hit
-                        fireMagicHitEvent({
-                            attacker  = caster,
-                            target    = object,
-                            spellId   = spellId,
-                            hitPos    = pos,
-                            spellType = core.magic.RANGE.Target,
-                            isAoE     = true,
-                            area      = finalRadius,
-                            effectScale = effectScale,
-                            effectIndex = dominantAreaEffectIndex(spell, forcedEffects),
-                            impactSpeed = impactSpeed, -- Forward projectile speed to the blast event
-                            maxSpeed  = maxSpeed,
-                            unreflectable = unreflectable,
-                            casterLinked = casterLinked,
-                            userData  = userData,
-                            muteAudio = muteAudio,
-                            muteLight = muteLight
-                        })
-                        affectedCount = affectedCount + 1
+                if not isActor and not (isLockUnlock and isLockable) then
+                    -- Cannot be affected by this blast; nothing to measure.
+                elseif isActor and not actorIsInScene(object, sceneActors) then
+                    -- The engine is not rendering this actor, so vanilla's
+                    -- `explodeSpell` cannot reach it either
+                    -- (`!world->isActorCollisionEnabled(affected)`) -- and a
+                    -- flash would rebuild a whole animation set to draw where
+                    -- nobody is looking. Counted, and reported once below.
+                    if appearsInRange then
+                        skippedOutOfScene = skippedOutOfScene + 1
+                    end
+                elseif not appearsInRange then
+                    -- On the cheap read alone: outside the ring. Counted so the
+                    -- screen is never silent, and never measured.
+                    skippedOutOfRange = skippedOutOfRange + 1
+                else
+                    local objPos, objRad = getObjectCenter(object)
+                    objPos = objPos or object.position
+                    local dist = (objPos - pos):length()
+                    if casterId and object.id == casterId then
+                        -- Report the skip only when the blast would have landed.
+                        if dist and dist <= (finalRadius + objRad) then casterSkipped = true end
+                    elseif dist and dist <= (finalRadius + objRad) and (not excludeTarget or object.id ~= excludeTarget.id) then
+                        if isLockUnlock and isLockable then
+                            handleDoorLockUnlock(spellId, caster, object, effectScale)
+                            affectedCount = affectedCount + 1
+                        elseif isActor and not isLockUnlock
+                            and not (types.Actor.objectIsInstance(object) and types.Actor.isDead(object))
+                            and not userDataIgnoresActor(object, userData) then
+                            -- Only the effects whose OWN radius reaches this actor
+                            -- (engine parity: each area effect explodes separately).
+                            -- An actor just inside the widest ring but outside a
+                            -- narrower effect's ring does not take that effect.
+                            local hitIndexes = {}
+                            for _, entry in ipairs(blastAreas) do
+                                if dist <= (entry.radius + objRad) then
+                                    hitIndexes[#hitIndexes + 1] = entry.index
+                                end
+                            end
+                            if #hitIndexes > 0 then
+                                applySpellToActor(spellId, caster, object, pos, true, itemObject, hitIndexes, unreflectable, casterLinked, userData, muteAudio, muteLight, continuousVfx, effectScale, nil, blastRangeType)
+                                -- Broadcast AoE hit
+                                fireMagicHitEvent({
+                                    attacker  = caster,
+                                    target    = object,
+                                    spellId   = spellId,
+                                    hitPos    = pos,
+                                    spellType = core.magic.RANGE.Target,
+                                    isAoE     = true,
+                                    area      = finalRadius,
+                                    effectScale = effectScale,
+                                    effectIndex = dominantAreaEffectIndex(spell, hitIndexes),
+                                    impactSpeed = impactSpeed, -- Forward projectile speed to the blast event
+                                    maxSpeed  = maxSpeed,
+                                    unreflectable = unreflectable,
+                                    casterLinked = casterLinked,
+                                    userData  = userData,
+                                    muteAudio = muteAudio,
+                                    muteLight = muteLight
+                                })
+                                affectedCount = affectedCount + 1
+                            end
+                        end
                     end
                 end
             end
+        end
+        if casterSkipped then
+            debugLog(string.format('[DETONATE] %s blast skipped its own caster (engine parity).', tostring(spellId)))
+        end
+        if skippedOutOfScene > 0 then
+            debugLog(string.format(
+                '[DETONATE] %s blast left out %d paged-out actor(s) inside the ring: not rendered, so the engine cannot reach them and no hit VFX may be attached (that would force a paging + animation rebuild).',
+                tostring(spellId), skippedOutOfScene))
+        end
+        if skippedOutOfRange > 0 then
+            -- The cheap screen's own bookkeeping: these references were never
+            -- measured at all (no bounding box, no scene node), which is the
+            -- whole point of the screen. Quiet at normal log levels.
+            debugLog(string.format(
+                '[DETONATE] %s blast measured %d of %d reference(s); %d outside the ring by position alone (no bounding box read).',
+                tostring(spellId), #targets - skippedOutOfRange - skippedOutOfScene,
+                #targets, skippedOutOfRange))
         end
         debugLog(string.format('[DETONATE] %s blast hit %d targets.', tostring(spellId), tonumber(affectedCount) or 0))
     end
@@ -4491,12 +5070,21 @@ local function autoDetectProjectileParams(spell, primaryEffectIndex)
 
     local rid = out.vfxRecId:lower()
     local rec = types.Weapon.records[rid] or types.Static.records[rid] or (types.MiscItem and types.MiscItem.records[rid])
-    if rec and rec.model then out.boltModel = rec.model end
+    if rec and rec.model and rec.model ~= "" then out.boltModel = rec.model end
 
     -- ---- mgef static VFX fields ----
     if mgef then
         local cvid = (mgef.castVfx and mgef.castVfx ~= "") and mgef.castVfx or nil
-        if not cvid then
+        -- An effect whose castStatic resolves to a record with no model has
+        -- declared "no cast mesh"; do not derive a school default for it.
+        local castSuppressed = false
+        if mgef.castStatic and mgef.castStatic ~= "" then
+            local csRec = types.Static.records[tostring(mgef.castStatic):lower()]
+            if csRec and (csRec.model == nil or csRec.model == "") then
+                castSuppressed = true
+            end
+        end
+        if not cvid and not castSuppressed then
             local schoolIdx = mgef.school or 2
             local sStr = "destruction"
             if type(schoolIdx) == "string" then sStr = schoolIdx:lower()
@@ -4524,7 +5112,7 @@ local function autoDetectProjectileParams(spell, primaryEffectIndex)
 
         local rid = tostring(cvid):lower()
         local rec = types.Static.records[rid] or types.Weapon.records[rid]
-        if rec and rec.model then out.castModel = rec.model end
+        if rec and rec.model and rec.model ~= "" then out.castModel = rec.model end
 
         if mgef.hitVfx   and mgef.hitVfx   ~= "" then out.hitModel    = mgef.hitVfx   end
         if mgef.areaStatic and mgef.areaStatic ~= "" then out.areaVfxRecId = mgef.areaStatic end
@@ -4686,6 +5274,9 @@ end
 --   userData         = {},              -- per-launch cookie persistence
 --   effectScale      = 1.0,             -- quick-cast penalty to apply the launch with;
 --                                       -- magnitudes and the resolved AoE area are scaled by it
+--   includeCaster    = false,           -- let this cast's own explosions hit the caster
+--                                       -- (engine parity says no: a blast never reaches the
+--                                       -- actor that produced it; userData.includeCaster works too)
 --   muteAudio        = false,           -- if true, skip in-flight sounds
 --   muteLight        = false,           -- if true, skip environmental lighting (glow)
 --   itemRequirements = {                -- required items to cast
@@ -4845,9 +5436,10 @@ local function _magExpEnsureActorVfxScript(actor)
     if not actor or not actor:isValid() then return end
     if actor.type == types.Player then return end
 
-    -- Non-player actors need a local handler to interpret AddVfx/RemoveVfx events.
-    -- You already do this elsewhere for persistent effects; do it here too.
-    addScriptOnce(actor, 'scripts/OMW_MagExp/magexp_actor_vfx.lua')
+    -- Non-player actors need a local handler to interpret AddVfx/RemoveVfx
+    -- events. OSSC may already have installed its own copy of the same
+    -- protocol, and it must not be duplicated -- see ensureActorVfxHandler.
+    ensureActorVfxHandler(actor)
 end
 
 local function spawnCastVfxForAllEffects(attacker, spell, spellId, opts)
@@ -4914,10 +5506,10 @@ function creationOwnership.update()
     creationOwnership.frame = creationOwnership.frame + 1
     for id, entry in pairs(creationOwnership.objects) do
         local object = entry.object
-        local owner = entry.owner and activeSpellRegistry[entry.owner.id]
+        local owner = entry.owner and MagExpState.activeProjectiles[entry.owner.id]
         if not object:isValid() then
             creationOwnership.objects[id] = nil
-            projectileItemRegistry[id] = nil
+            MagExpState.projectileItems[id] = nil
         elseif not entry.ready or not owner or owner.projectile ~= entry.owner
             or owner.lifecycleCancelRequestedAt ~= nil then
             -- A zero count also means a teleport is still queued. Only our own
@@ -4925,7 +5517,7 @@ function creationOwnership.update()
             -- zero count as confirmation. Never remove during a pending move.
             if entry.removalFrame and creationOwnership.frame > entry.removalFrame and object.count == 0 then
                 creationOwnership.objects[id] = nil
-                projectileItemRegistry[id] = nil
+                MagExpState.projectileItems[id] = nil
             elseif not entry.removalFrame and not entry.removalError and object.count > 0 then
                 object:remove()
                 entry.removalFrame = creationOwnership.frame
@@ -4958,6 +5550,21 @@ local function attachRequiredProjectileScript(object)
     -- This script is mandatory and registered CUSTOM. Configuration/programming
     -- errors must propagate to the request boundary; no nested silent fallback.
     if not object:hasScript(path) then object:addScript(path) end
+end
+
+-- Lua 5.4 removed the deprecated `math.atan2` (LuaJIT and Lua 5.1-5.3 still
+-- have it), so a build without it would take the whole launch down with
+-- "attempt to call a nil value (field 'atan2')". The replacement is the same
+-- two-argument arctangent, written portably.
+local function atan2(y, x)
+    if math.atan2 then return math.atan2(y, x) end
+    if x > 0 then return math.atan(y / x) end
+    if x < 0 then
+        return math.atan(y / x) + (y >= 0 and math.pi or -math.pi)
+    end
+    if y > 0 then return math.pi / 2 end
+    if y < 0 then return -math.pi / 2 end
+    return 0
 end
 
 local function launchSpell(data)
@@ -5275,6 +5882,13 @@ local function launchSpell(data)
     local effectScale = coerceEffectScale(data.effectScale)
     debugLog("Effect scale:", effectScale)
 
+    -- A caster is never a target of its own explosion (engine parity — see the
+    -- caster exclusion in detonateSpellAtPos). A launch that genuinely wants a
+    -- self-centred nova opts back in with includeCaster = true, per call or per
+    -- cast through userData.includeCaster.
+    local includeCaster = (data.includeCaster == true)
+        or (type(data.userData) == "table" and data.userData.includeCaster == true)
+
     -- Partition by per-effect range: Self only on caster; Touch only on hitObject; Target only via projectile indices.
     debugLog("Partitioning spell effects...")
     local selfIndexes, touchIndexes, targetIndexes = {}, {}, {}
@@ -5297,11 +5911,17 @@ local function launchSpell(data)
     debugLog("Effects partitioned - Self:", #selfIndexes, "Touch:", #touchIndexes, "Target:", #targetIndexes)
 
     local function casterTorsoPosition()
-        local zOffset = 95
+        -- The caster's middle: the rise from its feet to the box CENTRE, not
+        -- the cull-safe half-size (inflated, see resolveSpawnPos), so a Self
+        -- blast is centred on the body and not above the head.
+        local zOffset = 70
         local bbox = attacker:getBoundingBox()
         if bbox then
-            zOffset = bbox.halfSize.z
-            if zOffset > 105 then zOffset = 100 end
+            local half = bbox.halfSize and bbox.halfSize.z
+            local rise = (bbox.center and bbox.center.z - attacker.position.z) or nil
+            if rise and half and half > 0 and rise > half then rise = half end
+            zOffset = rise or half or 70
+            if zOffset < 25 then zOffset = 25 elseif zOffset > 110 then zOffset = 110 end
         end
         return attacker.position + util.vector3(0, 0, zOffset)
     end
@@ -5309,14 +5929,15 @@ local function launchSpell(data)
     if #selfIndexes > 0 then
         debugLog(string.format("Applying %d Self effect(s) on caster only for %s", #selfIndexes, spellId))
         local torsoPos = casterTorsoPosition()
-        local selfArea = maxAreaAmongIndexes(spell, selfIndexes)
-        if effectScale < 1 then
-            selfArea = math.max(0, math.floor(selfArea * effectScale + 0.5))
-        end
+        -- Per-effect areas, already reduced by the penalty: each Self effect
+        -- that has an area explodes at its own radius, a zero-area one does not
+        -- explode at all. The caster itself is outside the blast (engine
+        -- parity) and is covered by the direct application right below.
+        local selfAreas, selfArea = effectRules.resolvedAreas(spell, selfIndexes, effectScale)
         if selfArea > 0 then
-            detonateSpellAtPos(spellId, attacker, torsoPos, attacker.cell, itemObject, selfIndexes, data.unreflectable, data.casterLinked, nil, 0, 0, nil, nil, data.userData, data.muteAudio, data.muteLight, data.continuousVfx, effectScale, selfArea)
+            detonateSpellAtPos(spellId, attacker, torsoPos, attacker.cell, itemObject, selfIndexes, data.unreflectable, data.casterLinked, 0, 0, nil, nil, data.userData, data.muteAudio, data.muteLight, data.continuousVfx, effectScale, selfAreas, includeCaster, core.magic.RANGE.Self)
         end
-        applySpellToActor(spellId, attacker, attacker, torsoPos, false, itemObject, selfIndexes, data.unreflectable, data.casterLinked, data.userData, data.muteAudio, data.muteLight, data.continuousVfx, effectScale, data)
+        applySpellToActor(spellId, attacker, attacker, torsoPos, false, itemObject, selfIndexes, data.unreflectable, data.casterLinked, data.userData, data.muteAudio, data.muteLight, data.continuousVfx, effectScale, data, core.magic.RANGE.Self)
     end
 
     if #touchIndexes == 0 and #targetIndexes == 0 then
@@ -5361,22 +5982,31 @@ local function launchSpell(data)
             debugLog("[TOUCH] Valid target confirmed, proceeding with interaction")
             local hitPos = getObjectCenter(obj) or obj.position
             if isActor then
-                local zOffset = 95
+                -- The middle of the body, measured the same way as
+                -- resolveSpawnPos: the box CENTRE above the actor's feet (the
+                -- cull-safe half-size overstates the height).
+                local zOffset = 70
                 local bbox = obj:getBoundingBox()
                 if bbox then
-                    zOffset = bbox.halfSize.z
-                    if zOffset > 105 then zOffset = 100 end
+                    local half = bbox.halfSize and bbox.halfSize.z
+                    local rise = (bbox.center and bbox.center.z - obj.position.z) or nil
+                    if rise and half and half > 0 and rise > half then rise = half end
+                    zOffset = rise or half or 70
+                    if zOffset < 25 then zOffset = 25 elseif zOffset > 110 then zOffset = 110 end
                 end
                 hitPos = obj.position + util.vector3(0, 0, zOffset)
             end
 
-            local touchArea = maxAreaAmongIndexes(spell, touchIndexes)
-            if effectScale < 1 then
-                touchArea = math.max(0, math.floor(touchArea * effectScale + 0.5))
-            end
+            -- Per-effect areas, already reduced by the penalty: the touched
+            -- actor takes every Touch effect directly (below), while each
+            -- effect that has an area of its own explodes around it at its own
+            -- radius. The caster is outside that blast (engine parity — see
+            -- detonateSpellAtPos): it is standing at arm's reach of the centre,
+            -- so it used to be caught by its own touch explosion.
+            local touchAreas, touchArea = effectRules.resolvedAreas(spell, touchIndexes, effectScale)
 
             if touchArea > 0 then
-                detonateSpellAtPos(spellId, attacker, hitPos, obj.cell, itemObject, touchIndexes, data.unreflectable, data.casterLinked, nil, 0, 0, nil, obj, data.userData, data.muteAudio, data.muteLight, data.continuousVfx, effectScale, touchArea)
+                detonateSpellAtPos(spellId, attacker, hitPos, obj.cell, itemObject, touchIndexes, data.unreflectable, data.casterLinked, 0, 0, nil, obj, data.userData, data.muteAudio, data.muteLight, data.continuousVfx, effectScale, touchAreas, includeCaster, core.magic.RANGE.Touch)
             end
 
             if spellIsLockUnlock then
@@ -5384,7 +6014,7 @@ local function launchSpell(data)
                 handleDoorLockUnlock(spellId, attacker, obj, effectScale)
             elseif isActor and not (types.Actor.objectIsInstance(obj) and types.Actor.isDead(obj)) then
                 debugLog("[TOUCH] Applying spell to actor:", tostring(obj.recordId))
-                applySpellToActor(spellId, attacker, obj, hitPos, false, itemObject, touchIndexes, data.unreflectable, data.casterLinked, data.userData, data.muteAudio, data.muteLight, data.continuousVfx, effectScale, data)
+                applySpellToActor(spellId, attacker, obj, hitPos, false, itemObject, touchIndexes, data.unreflectable, data.casterLinked, data.userData, data.muteAudio, data.muteLight, data.continuousVfx, effectScale, data, core.magic.RANGE.Touch)
             else
                 debugLog("[TOUCH] WARNING: validTarget=true but no action taken (not lockable, not actor)")
             end
@@ -5399,6 +6029,7 @@ local function launchSpell(data)
                     target     = obj,
                     spellId    = spellId,
                     itemObject = itemObject,
+                    startPos   = data.startPos,
                     hitPos     = hitPos,
                     isAoE      = false,
                     area       = touchArea,
@@ -5431,8 +6062,13 @@ end
 
     -- ---- TARGET (projectile): one bolt per unique school in Target effects ----
 
-local area = data.area
-if area == nil then
+-- Whether this cast explodes is a property of its EFFECTS, exactly as
+-- `CastSpell::explodeSpell` reads them (`effectInfo.mData.mArea > 0`), so a
+-- radius the caller could not resolve arrives here as 0 or as nothing and the
+-- record fills it in. `area = 0` meaning "plain bolt" is what silently deleted
+-- every blast whose sender could not resolve the radius (findings 49, 50).
+local area = tonumber(data.area)
+if area == nil or area <= 0 then
     area = maxAreaAmongIndexes(spell, targetIndexes)
 end
 area = area or 0
@@ -5506,14 +6142,28 @@ for gi, group in ipairs(schoolGroups) do
         gi, #schoolGroups, tostring(group.school), #group.indexes
     ))
 
-    -- Per-bolt AoE radius: max area among that bolt’s indexes
-    local boltArea = data.area
-    if boltArea == nil then
+    -- Per-bolt AoE radius: max area among that bolt’s indexes. The record
+    -- answers when the launch could not (see above); only a caller-supplied
+    -- radius that is actually positive wins.
+    local boltArea = tonumber(data.area)
+    if boltArea == nil or boltArea <= 0 then
         boltArea = maxAreaAmongIndexes(spell, group.indexes)
     end
     boltArea = boltArea or 0
     if effectScale < 1 then
         boltArea = math.max(0, math.floor(boltArea * effectScale + 0.5))
+    end
+
+    -- Per-effect radii for this bolt's own indexes (engine parity): each area
+    -- effect of the bolt explodes at its own radius when it lands, and a
+    -- zero-area effect — already applied to whatever the bolt hit — does not
+    -- explode at all. Kept beside boltArea, which stays the widest radius the
+    -- projectile carries and publishes. A caller that forced one explicit area
+    -- for the whole launch (data.area) keeps that uniform radius instead, so
+    -- this stays nil and the collision falls back to the number.
+    local boltAreas = nil
+    if (tonumber(data.area) or 0) <= 0 then
+        boltAreas = effectRules.resolvedAreas(spell, group.indexes, effectScale)
     end
 
     -- ✅ NEW: Collect ALL unique VFX models for this school group's effects
@@ -5628,7 +6278,7 @@ for gi, group in ipairs(schoolGroups) do
 
     local rotation = data.initialRotation
     if not rotation then
-        local yaw   = math.atan2(dir.x, dir.y)
+        local yaw   = atan2(dir.x, dir.y)
         local pitch = math.asin(math.max(-1, math.min(1, dir.z)))
         rotation = util.transform.rotateZ(yaw) * util.transform.rotateX(-pitch)
     end
@@ -5647,7 +6297,7 @@ for gi, group in ipairs(schoolGroups) do
 
         -- Per-projectile registry for live item object (enchantments)
         if itemObject and type(itemObject) ~= "string" then
-            projectileItemRegistry[proj.id] = itemObject
+            MagExpState.projectileItems[proj.id] = itemObject
         end
 
         attachRequiredProjectileScript(proj)
@@ -5734,7 +6384,7 @@ for gi, group in ipairs(schoolGroups) do
 
         -- Register in live spell registry
         local launchTime = core.getSimulationTime()
-        activeSpellRegistry[proj.id] = {
+        MagExpState.activeProjectiles[proj.id] = {
             projectile    = proj,
             spellId       = spellId,
             attacker      = attacker,
@@ -5745,9 +6395,28 @@ for gi, group in ipairs(schoolGroups) do
             userData      = data.userData,
             muteAudio     = data.muteAudio,
             muteLight     = data.muteLight,
-            continuousVfx = data.continuousVfx
+            continuousVfx = data.continuousVfx,
+            -- Blast geometry the terminal detonation must use: this bolt's own
+            -- per-effect areas (nil when the caller forced one uniform area),
+            -- and whether this cast opted into hitting its own caster.
+            areaByEffect  = boltAreas,
+            includeCaster = includeCaster or nil
         }
         creationOwnership.objects[proj.id] = nil -- live registry now owns cleanup
+
+        -- Publish the live carrier after ownership has moved to the registry.
+        -- Consumers can use this for presentation that follows the real
+        -- projectile (for example a screen-space shader) without replacing or
+        -- duplicating SFP's collision simulation.
+        core.sendGlobalEvent('MagExp_ProjectileLaunched', {
+            projectile = proj,
+            projectileId = proj.id,
+            attacker = attacker,
+            spellId = spellId,
+            velocity = dir * speed,
+            maxLifetime = maxLifetime,
+            userData = data.userData,
+        })
 
         debugLog(string.format(
             "[LAUNCH] Launched bolt %d/%d for '%s' school=%s spd=%d",
@@ -5757,12 +6426,25 @@ for gi, group in ipairs(schoolGroups) do
         lastProj = proj
     end
 end
--- [SKILL] Award progression for all schools after spell fires successfully
+-- [SKILL] Award progression after spell fires successfully. The vanilla
+-- rules (engine `spellIncreasesSkill` / `CastSpell::cast(item)`) apply: a
+-- plain spell without the "Always Succeeds" flag raises each school it
+-- uses; a CastOnUse ("Cast When Used") item raises Enchant once per use;
+-- powers, abilities, always-succeed spells and scrolls (CastOnce) raise
+-- nothing and stay silent. skillId 'enchant' alone identifies the
+-- CastWhenUsed raise; the school is carried with it for consumers other
+-- than skill progression.
 if not data.isFree and not (data.userData and data.userData.OSSC) then
-    local isEnchant = (itemObject ~= nil)
-    local schools = collectSpellSchools(spell)
-    for _, entry in ipairs(schools) do
-        awardSpellSkillProgress(attacker, entry.school, spell.cost, isEnchant, spell.id)
+    if itemObject ~= nil then
+        if spell and spell.type == core.magic.ENCHANTMENT_TYPE.CastOnUse then
+            local schools = collectSpellSchools(spell)
+            awardSpellSkillProgress(attacker, 'enchant', schools[1] and schools[1].school,
+                spell.cost, spell.id)
+        end
+    elseif spellIncreasesSkillRecord(spell) then
+        for _, entry in ipairs(collectSpellSchools(spell)) do
+            awardSpellSkillProgress(attacker, entry.school, entry.school, spell.cost, spell.id)
+        end
     end
 end
 
@@ -5785,20 +6467,20 @@ end
 
 local function clearProjectileRegistries(projectileId)
     if projectileId == nil then return end
-    projectileItemRegistry[projectileId] = nil
-    activeSpellRegistry[projectileId] = nil
-    pendingProjectileMoves[projectileId] = nil
-    pauseWork.moves[projectileId] = nil
-    pauseWork.sounds[projectileId] = nil
-    pauseWork.lights[projectileId] = nil
-    for id in pairs(pauseWork.anchorIds[projectileId] or {}) do pauseWork.anchors[id] = nil end
-    pauseWork.anchorIds[projectileId] = nil
+    MagExpState.projectileItems[projectileId] = nil
+    MagExpState.activeProjectiles[projectileId] = nil
+    MagExpState.pendingProjectileMoves[projectileId] = nil
+    MagExpState.pauseWork.moves[projectileId] = nil
+    MagExpState.pauseWork.sounds[projectileId] = nil
+    MagExpState.pauseWork.lights[projectileId] = nil
+    for id in pairs(MagExpState.pauseWork.anchorIds[projectileId] or {}) do MagExpState.pauseWork.anchors[id] = nil end
+    MagExpState.pauseWork.anchorIds[projectileId] = nil
 end
 
 local function cancelSpell(projectile, reason)
     if not projectile or not projectile:isValid() then return end
     local projectileId = projectile.id
-    local registryEntry = activeSpellRegistry[projectileId]
+    local registryEntry = MagExpState.activeProjectiles[projectileId]
     if registryEntry and registryEntry.projectile == projectile then
         if registryEntry.lifecycleCancelRequestedAt == nil then
             registryEntry.lifecycleCancelRequestedAt = core.getSimulationTime()
@@ -5820,18 +6502,18 @@ end
 local function retryPendingProjectileMoves()
     if core.isWorldPaused() then return end
     local currentTime = core.getSimulationTime()
-    for projId, move in pairs(pendingProjectileMoves) do
-        local registryEntry = activeSpellRegistry[projId]
+    for projId, move in pairs(MagExpState.pendingProjectileMoves) do
+        local registryEntry = MagExpState.activeProjectiles[projId]
         local proj = move.projectile
         if not proj or not proj:isValid() or not registryEntry or registryEntry.projectile ~= proj then
-            pendingProjectileMoves[projId] = nil
+            MagExpState.pendingProjectileMoves[projId] = nil
         elseif registryEntry.lifecycleCancelRequestedAt ~= nil then
             -- Keep the lifecycle entry until terminal cleanup or its backstop.
-            pendingProjectileMoves[projId] = nil
+            MagExpState.pendingProjectileMoves[projId] = nil
         elseif currentTime >= move.nextAttemptAt then
             local moved, err = teleportProjectileMove(proj, move.newPos, move.newRot)
             if moved then
-                pendingProjectileMoves[projId] = nil
+                MagExpState.pendingProjectileMoves[projId] = nil
             else
                 move.lastError = tostring(err)
                 move.attempts = move.attempts + 1
@@ -5847,18 +6529,18 @@ local function sweepProjectileLifecycles()
     if currentTime < nextProjectileLifecycleSweepAt then return end
     nextProjectileLifecycleSweepAt = currentTime + PROJECTILE_LIFECYCLE_SWEEP_INTERVAL
 
-    for projId, move in pairs(pendingProjectileMoves) do
-        local registryEntry = activeSpellRegistry[projId]
+    for projId, move in pairs(MagExpState.pendingProjectileMoves) do
+        local registryEntry = MagExpState.activeProjectiles[projId]
         local proj = move.projectile
         if not proj or not proj:isValid() or not registryEntry or registryEntry.projectile ~= proj then
-            pendingProjectileMoves[projId] = nil
+            MagExpState.pendingProjectileMoves[projId] = nil
         elseif (currentTime - move.firstFailedAt) > PROJECTILE_MOVE_RETRY_MAX_AGE
             or move.attempts >= PROJECTILE_MOVE_RETRY_MAX_ATTEMPTS
         then
-            pendingProjectileMoves[projId] = nil
-            pauseWork.moves[projId] = nil
-            pauseWork.sounds[projId] = nil
-            pauseWork.lights[projId] = nil
+            MagExpState.pendingProjectileMoves[projId] = nil
+            MagExpState.pauseWork.moves[projId] = nil
+            MagExpState.pauseWork.sounds[projId] = nil
+            MagExpState.pauseWork.lights[projId] = nil
             print('[MagExp] Movement abandoned for ' .. projId .. ': ' .. tostring(move and move.lastError))
             cancelSpell(proj, 'movement retry limit reached')
         end
@@ -5867,28 +6549,28 @@ end
 
 local function onProjectileMove(data)
     local proj = data.projectile
-    local entry = proj and proj:isValid() and activeSpellRegistry[proj.id]
+    local entry = proj and proj:isValid() and MagExpState.activeProjectiles[proj.id]
     if entry and entry.projectile == proj and entry.lifecycleCancelRequestedAt == nil and data.newPos then
         -- One placement per projectile per update, including the last sample
         -- delivered as the world entered pause. Newer samples supersede it.
-        pauseWork.moves[proj.id] = data
+        MagExpState.pauseWork.moves[proj.id] = data
     end
 end
 
 local function applyProjectileMove(data)
     local proj, newPos = data.projectile, data.newPos
-    local entry = proj and proj:isValid() and activeSpellRegistry[proj.id]
+    local entry = proj and proj:isValid() and MagExpState.activeProjectiles[proj.id]
     if not entry or entry.projectile ~= proj or entry.lifecycleCancelRequestedAt ~= nil then return end
     local projId, currentTime = proj.id, core.getSimulationTime()
-    local pending = pendingProjectileMoves[projId]
+    local pending = MagExpState.pendingProjectileMoves[projId]
     if pending and currentTime < pending.nextAttemptAt then
         pending.newPos, pending.newRot = newPos, data.newRot
     else
         local moved, err = teleportProjectileMove(proj, newPos, data.newRot)
         if moved then
-            pendingProjectileMoves[projId] = nil
+            MagExpState.pendingProjectileMoves[projId] = nil
         else
-            pendingProjectileMoves[projId] = {
+            MagExpState.pendingProjectileMoves[projId] = {
                 projectile = proj, newPos = newPos, newRot = data.newRot,
                 firstFailedAt = pending and pending.firstFailedAt or currentTime,
                 nextAttemptAt = currentTime + PROJECTILE_MOVE_RETRY_INTERVAL,
@@ -5928,8 +6610,8 @@ local function onProjectileCollision(data)
     local impactSpeed = velocity:length()
 
     -- Registry lookups (Cleanup moved to end of function to allow event listeners access)
-    local itemRecordId = (proj and proj.id and projectileItemRegistry[proj.id]) or data.itemRecordId
-    local registryEntry = proj and proj.id and activeSpellRegistry[proj.id]
+    local itemRecordId = (proj and proj.id and MagExpState.projectileItems[proj.id]) or data.itemRecordId
+    local registryEntry = proj and proj.id and MagExpState.activeProjectiles[proj.id]
     local refMaxSpeed   = (registryEntry and registryEntry.maxSpeed) or (impactSpeed > 1000 and impactSpeed or 1500)
     local userData      = (registryEntry and registryEntry.userData) or data.userData
     local muteAudio     = data.muteAudio or false
@@ -5956,9 +6638,35 @@ local function onProjectileCollision(data)
     end
 
     local effectIndexes = data.effectIndexes
+    -- ── Does this cast explode? The RECORD answers that ──
+    -- `CastSpell::explodeSpell` walks the cast's own effects and explodes every
+    -- one whose `mArea` is above zero. It never asks a caller how wide the
+    -- blast is, and neither may this: gating on the number a launch happened to
+    -- report (`data.area`) meant that a launch which reported 0 -- a router
+    -- that could not resolve the radius, an enchantment, an emitter, another
+    -- mod -- silently turned every area spell into a plain bolt. Nothing
+    -- exploded: not on a body, not on the ground, and the only thing left was
+    -- the per-effect hit static (findings 49, 50).
+    local recordBlastArea = 0
+    if spell then
+        local _, resolved = effectRules.resolveBlast(spell, effectIndexes, nil,
+            data.effectScale)
+        recordBlastArea = resolved or 0
+    end
+    -- The blast geometry this launch resolved: the bolt's own per-effect areas
+    -- when the registry entry carries them, otherwise the single widest area
+    -- the collision reports -- but only when that number is real. A zero (or
+    -- absent) radius is not an instruction to suppress the explosion; it means
+    -- "not resolved here", and the record supplies it below.
+    local reportedArea = tonumber(area) or 0
+    local areaOverride = (registryEntry and registryEntry.areaByEffect)
+        or ((reportedArea > 0) and reportedArea or nil)
+    local includeCaster = (registryEntry and registryEntry.includeCaster)
+        or data.includeCaster
+        or (type(userData) == "table" and userData.includeCaster)
     -- [ORDER: Detonation First]
-    if area > 0 then
-        detonateSpellAtPos(spellId, attacker, hitPos, cell, itemRecordId, effectIndexes, data.unreflectable, data.casterLinked, data.areaVfxRecId or data.vfxRecId, impactSpeed, refMaxSpeed, data.areaVfxScale, target, userData, muteAudio, muteLight, data.continuousVfx, data.effectScale, area)
+    if reportedArea > 0 or recordBlastArea > 0 then
+        detonateSpellAtPos(spellId, attacker, hitPos, cell, itemRecordId, effectIndexes, data.unreflectable, data.casterLinked, impactSpeed, refMaxSpeed, data.areaVfxScale, target, userData, muteAudio, muteLight, data.continuousVfx, data.effectScale, areaOverride, includeCaster, core.magic.RANGE.Target)
     elseif not (target and target:isValid() and (target.type == types.NPC or target.type == types.Creature or target.type == types.Player)) then
         spawnProjectileImpactVfx(data, hitPos)
     end
@@ -5970,8 +6678,9 @@ local function onProjectileCollision(data)
 if spellIsLockUnlock and isLockable then
     handleDoorLockUnlock(spellId, attacker, target, data.effectScale)
 elseif isActor and not (types.Actor.objectIsInstance(target) and types.Actor.isDead(target)) then
-    applySpellToActor(spellId, attacker, target, hitPos, false, itemRecordId, effectIndexes, data.unreflectable, data.casterLinked, userData, muteAudio, muteLight, data.continuousVfx, data.effectScale, data)
-elseif not isActor and not isLockable and area == 0 then
+    applySpellToActor(spellId, attacker, target, hitPos, false, itemRecordId, effectIndexes, data.unreflectable, data.casterLinked, userData, muteAudio, muteLight, data.continuousVfx, data.effectScale, data, core.magic.RANGE.Target)
+elseif not isActor and not isLockable
+    and reportedArea == 0 and recordBlastArea == 0 then
     debugLog("[COLLISION] Non-actor hit detected for non-AOE spell")
 
     local impactSound = type(userData) == "table" and userData.impactSound or nil
@@ -6011,7 +6720,9 @@ end
         projectile    = proj,
         spellType     = core.magic.RANGE.Target,
         isAoE         = false,
-        area          = area,
+        -- The radius this impact really had: the launch's own number, or the
+        -- record's when the launch could not resolve one.
+        area          = (reportedArea > 0) and reportedArea or recordBlastArea,
         -- The bolt carries the penalty it was launched with; a penalised hit
         -- must report the reduced magnitudes to listeners that hit from them.
         effectScale   = data.effectScale,
@@ -6036,7 +6747,7 @@ end
 
 local function canCreateAnchor(data)
     local projectile = data and data.projectile
-    local entry = projectile and projectile:isValid() and activeSpellRegistry[projectile.id]
+    local entry = projectile and projectile:isValid() and MagExpState.activeProjectiles[projectile.id]
     return entry and entry.projectile == projectile and entry.lifecycleCancelRequestedAt == nil
 end
 
@@ -6059,7 +6770,7 @@ local function createLightAnchor(data)
         local c = recId.color or util.vector3(1, 1, 1)
         local rad = recId.radius or 200
         local key = string.format("light_%d_%d_%d_%d", math.floor(c.x * 255), math.floor(c.y * 255), math.floor(c.z * 255), rad)
-        if not cachedDynamicRecords[key] then
+        if not MagExpState.dynamicRecords[key] then
             local colorObj = (util.color and util.color.rgb) and util.color.rgb(c.x, c.y, c.z) or c
             local draft = types.Light.createRecordDraft({
                 name = "MagExp Light",
@@ -6071,9 +6782,9 @@ local function createLightAnchor(data)
                 flicker = false,
             })
             local newRec = world.createRecord(draft)
-            cachedDynamicRecords[key] = newRec.id
+            MagExpState.dynamicRecords[key] = newRec.id
         end
-        recId = cachedDynamicRecords[key]
+        recId = MagExpState.dynamicRecords[key]
     end
 
     local anchor = world.createObject(recId, 1)
@@ -6088,29 +6799,29 @@ local function flushPauseWork()
     if core.isWorldPaused() then return end
     -- Take requests before invoking callbacks. Failed creation/casting may have
     -- partially succeeded: report it once and never blindly replay the request.
-    for id, anchor in pairs(pauseWork.anchorFailures or {}) do
-        if not anchor:isValid() then pauseWork.anchorFailures[id] = nil end
+    for id, anchor in pairs(MagExpState.pauseWork.anchorFailures or {}) do
+        if not anchor:isValid() then MagExpState.pauseWork.anchorFailures[id] = nil end
     end
-    local casts = pauseWork.casts
-    pauseWork.casts = {}
-    pauseWork.castOverflowReported = false
+    local casts = MagExpState.pauseWork.casts
+    MagExpState.pauseWork.casts = {}
+    MagExpState.pauseWork.castOverflowReported = false
     for _, data in ipairs(casts) do
         if data.attacker:isValid() then launchSpell(data) end
     end
-    local moves = pauseWork.moves
-    pauseWork.moves = {}
+    local moves = MagExpState.pauseWork.moves
+    MagExpState.pauseWork.moves = {}
     for _, data in pairs(moves) do applyProjectileMove(data) end
     retryPendingProjectileMoves()
     for _, kind in ipairs({ 'sounds', 'lights' }) do
-        local requests = pauseWork[kind]
-        pauseWork[kind] = {}
+        local requests = MagExpState.pauseWork[kind]
+        MagExpState.pauseWork[kind] = {}
         for _, data in pairs(requests) do
             if kind == 'sounds' then createSoundAnchor(data) else createLightAnchor(data) end
         end
     end
-    local anchors = pauseWork.anchors
-    pauseWork.anchors = {}
-    pauseWork.anchorIds = {}
+    local anchors = MagExpState.pauseWork.anchors
+    MagExpState.pauseWork.anchors = {}
+    MagExpState.pauseWork.anchorIds = {}
     for _, move in pairs(anchors) do
         if move.anchor:isValid() and (not move.projectile or canCreateAnchor(move)) then
             move.anchor:teleport(move.cell, move.position)
@@ -6128,10 +6839,10 @@ local function onCastRequest(data)
         return
     end
     if not core.isWorldPaused() then return launchSpell(data) end
-    if #pauseWork.casts < MAX_PAUSED_CAST_REQUESTS then
-        pauseWork.casts[#pauseWork.casts + 1] = data
-    elseif not pauseWork.castOverflowReported then
-        pauseWork.castOverflowReported = true
+    if #MagExpState.pauseWork.casts < MAX_PAUSED_CAST_REQUESTS then
+        MagExpState.pauseWork.casts[#MagExpState.pauseWork.casts + 1] = data
+    elseif not MagExpState.pauseWork.castOverflowReported then
+        MagExpState.pauseWork.castOverflowReported = true
         print('[MagExp] Paused cast queue full; further requests rejected until resume.')
     end
 end
@@ -6166,14 +6877,14 @@ local function onUpdate(dt)
     end
 
  -- [NEW] continuousVFX Actor Registry Cleanup
- for actorId, regData in pairs(continuousVfxActors) do
+ for actorId, regData in pairs(MagExpState.continuousVfxActors) do
     local actor = regData.actor
     local spellId = regData.spellId
     local vfxTag = regData.vfxTag
     
     if not actor or not actor:isValid() then
         debugLog("[continuousVFX Registry] Removing invalid actor:", actorId)
-        continuousVfxActors[actorId] = nil
+        MagExpState.continuousVfxActors[actorId] = nil
      else
         local isActive = false
         local activeSpells = types.Actor.activeSpells(actor)
@@ -6192,7 +6903,7 @@ local function onUpdate(dt)
             -- Also clean world.vfx registry (for cast glow spawned via world.vfx.spawn)
             world.vfx.remove(vfxTag)
             
-            continuousVfxActors[actorId] = nil
+            MagExpState.continuousVfxActors[actorId] = nil
             debugLog("[continuousVFX Registry] Unregistered actor:", actorId)
         end
     end
@@ -6202,7 +6913,7 @@ end
  local gameTime = core.getSimulationTime()
  if not MagExp_NextCleanup or gameTime > MagExp_NextCleanup then
     MagExp_NextCleanup = gameTime + 0.1
-    for targetId, spells in pairs(activeVfxRegistry) do
+    for targetId, spells in pairs(MagExpState.activeVfx) do
         local anyRemaining = false
         for regKey, val in pairs(spells) do
             local tgt, spellKey, removeVfxId
@@ -6245,7 +6956,7 @@ end
                 end
             end
         end
-        if not anyRemaining then activeVfxRegistry[targetId] = nil end
+        if not anyRemaining then MagExpState.activeVfx[targetId] = nil end
     end
 end
 end
@@ -6266,6 +6977,16 @@ local MagExpPublicInterface = {
 
     --- Apply spell effects directly to an actor.
     -- @param spellId string, caster Actor, target Actor, hitPos vector3, isAoe boolean, itemObject Object, forcedEffects table, unreflectable boolean, casterLinked boolean, userData table, muteAudio boolean, muteLight boolean, continuousVfx boolean
+    --- Apply a spell (or part of one) straight to an actor.
+    -- @param spellId string, caster Actor, target Actor, hitPos vector3, isAoe boolean, itemObject Object|string, forcedEffects table, unreflectable boolean, casterLinked boolean, userData table, muteAudio boolean, muteLight boolean, continuousVfx boolean, effectScale number, sourceData table, rangeType number
+    -- forcedEffects is a list of 0-based effect indexes; omit it to apply the
+    -- whole record.  rangeType is the range type of THIS application
+    -- (core.magic.RANGE.Self / Touch / Target) and reproduces the engine's own
+    -- filter in CastSpell::inflict — `if (enam.mData.mRange != range) continue;`
+    -- — so a Self-range effect lands on a bystander when the application is the
+    -- Self-range blast of an area Self spell (Morrowind's Fire Burst).  Left
+    -- nil, the stricter legacy rule applies instead: Self-range effects are
+    -- stripped from any target that is not the caster.
     applySpellToActor = applySpellToActor,
 
     --- Helper: Emit a spell projectile directly from a non-actor object (like a door, trap, activator, or script).
@@ -6325,13 +7046,27 @@ local MagExpPublicInterface = {
     end,
 
     --- Trigger an AoE blast at a world position.
-    -- @param spellId string, caster Actor, pos vector3, cell Cell, itemObject Object, forcedEffects table, unreflectable boolean, casterLinked boolean, vfxOverride string, impactSpeed number, maxSpeed number, areaVfxScale number, excludeTarget Object, userData table, muteAudio boolean, muteLight boolean, continuousVfx boolean, effectScale number, areaOverride number
+    -- @param spellId string, caster Actor, pos vector3, cell Cell, itemObject Object, forcedEffects table, unreflectable boolean, casterLinked boolean, impactSpeed number, maxSpeed number, areaVfxScale number, excludeTarget Object, userData table, muteAudio boolean, muteLight boolean, continuousVfx boolean, effectScale number, areaOverride number|table, includeCaster boolean, rangeType number
     -- effectScale is the quick-cast penalty the cast was reduced with: callers
     -- that know it (OSSC passes it with its cast request) must forward it, so the
     -- blast's radius and every published magnitude match the reduced effects.
     -- areaOverride is an already-resolved area in feet; when given it wins over
     -- the record lookup, so a caller that scaled the area itself is never
-    -- scaled twice.
+    -- scaled twice. It is either ONE number — a uniform radius for every effect
+    -- of this blast — or a table of per-index areas in feet ({ [0] = 15 }), which
+    -- is what launchSpell's own partitions pass. Without an override each effect
+    -- resolves its own area from the record, reduced by effectScale, and only an
+    -- effect with an area of its own explodes (engine parity).
+    -- The blast never reaches `caster` — OpenMW's CastSpell::explodeSpell skips
+    -- the caster beside the `excludeTarget` it already hit — unless includeCaster
+    -- is true (or userData.includeCaster is), which opts a deliberately
+    -- self-centred nova back in.
+    -- rangeType is the range type of this explosion (core.magic.RANGE.Self /
+    -- Touch / Target), i.e. which of the record's effects may land on an actor
+    -- in the ring; the engine always explodes one range type at a time. SFP's
+    -- own detonations pass it. Omitted, it is inferred when every exploding
+    -- effect agrees on one range, and a mixed list keeps the stricter legacy
+    -- gate (Self-range effects stripped from anyone but the caster).
     detonateSpellAtPos = detonateSpellAtPos,
 
     --- Apply scroll consumption or enchantment charge deduction. Must run from global script context;
@@ -6340,9 +7075,9 @@ local MagExpPublicInterface = {
     applyResourceConsumption = magExpApplyInventoryResourceConsumption,
 
     --- Register a custom target filter. Returns true/false to allow/block hits.
-    addTargetFilter = function(f) table.insert(customFilters, f) end,
+    addTargetFilter = function(f) table.insert(MagExpState.customFilters, f) end,
     -- Deprecated but kept for backward compatibility:
-    setTargetFilter = function(f) table.insert(customFilters, f) end,
+    setTargetFilter = function(f) table.insert(MagExpState.customFilters, f) end,
     STACK_CONFIG = STACK_CONFIG,
 
     --- Lifecycle hooks (to be overridden by other mods)
@@ -6361,7 +7096,7 @@ local MagExpPublicInterface = {
     --- Get full state snapshot of a live spell projectile.
     --- Reply arrives as global event 'MagExp_SpellState' with matching tag.
     getSpellState = function(projId, tag)
-        local e = activeSpellRegistry[projId]
+        local e = MagExpState.activeProjectiles[projId]
         if e and e.projectile:isValid() then
             e.projectile:sendEvent('MagExp_GetState', { tag = tag })
         end
@@ -6370,7 +7105,7 @@ local MagExpPublicInterface = {
     --- Mutate any physics property of a spell currently in flight.
     --- All fields optional; only provided keys are applied.
     setSpellPhysics = function(projId, data)
-        local e = activeSpellRegistry[projId]
+        local e = MagExpState.activeProjectiles[projId]
         if e and e.projectile:isValid() then
             e.projectile:sendEvent('MagExp_SetPhysics', data)
             -- Keep the global lifecycle backstop aligned with local mutations.
@@ -6382,7 +7117,7 @@ local MagExpPublicInterface = {
 
     --- Redirect a spell projectile toward a new direction vector (speed is preserved).
     redirectSpell = function(projId, newDirection)
-        local e = activeSpellRegistry[projId]
+        local e = MagExpState.activeProjectiles[projId]
         if e and e.projectile:isValid() then
             e.projectile:sendEvent('MagExp_SetPhysics', { direction = newDirection })
         end
@@ -6392,7 +7127,7 @@ local MagExpPublicInterface = {
     --- the skipped path. Optional velocity/direction/speed changes are applied
     --- atomically by the projectile's local simulation.
     warpSpell = function(projId, data)
-        local e = activeSpellRegistry[projId]
+        local e = MagExpState.activeProjectiles[projId]
         if not (e and e.projectile:isValid() and type(data) == "table" and (data.position or data.pos)) then
             return false
         end
@@ -6402,7 +7137,7 @@ local MagExpPublicInterface = {
 
     --- Override the current speed of a spell projectile without changing its direction.
     setSpellSpeed = function(projId, newSpeed)
-        local e = activeSpellRegistry[projId]
+        local e = MagExpState.activeProjectiles[projId]
         if e and e.projectile:isValid() then
             e.projectile:sendEvent('MagExp_SetPhysics', { speed = newSpeed })
         end
@@ -6410,7 +7145,7 @@ local MagExpPublicInterface = {
 
     --- Pause or resume a spell projectile.
     setSpellPaused = function(projId, paused)
-        local e = activeSpellRegistry[projId]
+        local e = MagExpState.activeProjectiles[projId]
         if e and e.projectile:isValid() then
             e.projectile:sendEvent('MagExp_SetPhysics', { isPaused = paused })
             e.isPaused = paused == true
@@ -6419,23 +7154,23 @@ local MagExpPublicInterface = {
 
     --- Force-cancel and remove a live spell projectile.
     cancelSpell = function(projId)
-        local e = activeSpellRegistry[projId]
+        local e = MagExpState.activeProjectiles[projId]
         if e and e.projectile and e.projectile:isValid() then
             if e.lifecycleCancelRequestedAt ~= nil then return end
             -- Reject already-delivered movement and anchor creation immediately;
             -- the local cancellation event still owns terminal notification.
             e.lifecycleCancelRequestedAt = core.getSimulationTime()
-            pauseWork.moves[projId] = nil
-            pauseWork.sounds[projId] = nil
-            pauseWork.lights[projId] = nil
-            pendingProjectileMoves[projId] = nil
+            MagExpState.pauseWork.moves[projId] = nil
+            MagExpState.pauseWork.sounds[projId] = nil
+            MagExpState.pauseWork.lights[projId] = nil
+            MagExpState.pendingProjectileMoves[projId] = nil
             e.projectile:sendEvent('MagExp_ForceCancel')
         end
     end,
 
     --- Configure bounce behaviour on a live spell projectile.
     setSpellBounce = function(projId, enabled, bounceMax, bouncePower)
-        local e = activeSpellRegistry[projId]
+        local e = MagExpState.activeProjectiles[projId]
         if e and e.projectile:isValid() then
             e.projectile:sendEvent('MagExp_SetPhysics', {
                 bounceEnabled = enabled,
@@ -6447,7 +7182,7 @@ local MagExpPublicInterface = {
 
     --- Toggle whether a bouncing spell detonates on actor contact.
     setSpellDetonateOnActor = function(projId, value)
-        local e = activeSpellRegistry[projId]
+        local e = MagExpState.activeProjectiles[projId]
         if e and e.projectile:isValid() then
             e.projectile:sendEvent('MagExp_SetPhysics', { detonateOnActorHit = value })
         end
@@ -6455,7 +7190,7 @@ local MagExpPublicInterface = {
 
     --- Toggle piercing and/or change pierce cap on a live spell projectile.
     setSpellPiercing = function(projId, enabled, newLimit)
-        local e = activeSpellRegistry[projId]
+        local e = MagExpState.activeProjectiles[projId]
         if e and e.projectile:isValid() then
             e.projectile:sendEvent('MagExp_SetPhysics', {
                 piercing = enabled,
@@ -6467,7 +7202,7 @@ local MagExpPublicInterface = {
     --- Get all IDs of currently active MagExp spell projectiles.
     getActiveSpellIds = function()
         local ids = {}
-        for id, _ in pairs(activeSpellRegistry) do table.insert(ids, id) end
+        for id, _ in pairs(MagExpState.activeProjectiles) do table.insert(ids, id) end
         return ids
     end,
 
@@ -6564,7 +7299,7 @@ local MagExpPublicInterface = {
     -- @param isPressFn function  Returns true while key is held (uses input.isKeyPressed etc.)
     registerChargeKey = function(keyId, isPressFn)
         if keyId and type(isPressFn) == "function" then
-            chargeKeyRegistry[keyId] = isPressFn
+            MagExpState.chargeKeys[keyId] = isPressFn
         end
     end,
 
@@ -6573,7 +7308,7 @@ local MagExpPublicInterface = {
     -- @param keyId string
     -- @return boolean
     isChargeKeyHeld = function(keyId)
-        local fn = chargeKeyRegistry[keyId]
+        local fn = MagExpState.chargeKeys[keyId]
         if fn then
             -- registerChargeKey already type-checks the registration, so `fn`
             -- is a function. If calling it raises, that is the registering
@@ -6586,7 +7321,7 @@ local MagExpPublicInterface = {
     end,
 
     --- Internal: expose registry for player script polling in onUpdate.
-    _chargeKeyRegistry = chargeKeyRegistry,
+    _chargeKeyRegistry = MagExpState.chargeKeys,
 }
 
 -- ============================================================
@@ -6600,9 +7335,12 @@ return {
         onSave = creationOwnership.save,
         onLoad = function(data)
             creationOwnership.load(data)
-            -- A load can replace the record world these caches describe: drop
-            -- them (they rebuild lazily) and re-register the actors instead of
-            -- trusting a picture taken before the load.
+            -- A load replaces the record world these caches describe. Rebuild
+            -- reduced spell lookups lazily against the loaded save so matching
+            -- generated records are reused rather than duplicated.
+            reducedSpellRecords = {}
+            reducedSpellIdsBySource = {}
+            savedReducedRecordsByName = nil
             effectKindProbe.clearRecordCaches()
             resetSummonStateWatch()
         end,
@@ -6703,13 +7441,13 @@ return {
         MagExp_CreateSoundAnchor = function(data)
             if data.lightAnchor and data.lightAnchor:isValid() then queueAnchorMove(data.lightAnchor, data.lightAnchor.cell, data.pos, data.projectile) end
             if data.soundAnchor and data.soundAnchor:isValid() then queueAnchorMove(data.soundAnchor, data.soundAnchor.cell, data.pos, data.projectile) end
-            if canCreateAnchor(data) then pauseWork.sounds[data.projectile.id] = data end
+            if canCreateAnchor(data) then MagExpState.pauseWork.sounds[data.projectile.id] = data end
         end,
 
         MagExp_CreateLightAnchor = function(data)
             if data.lightAnchor and data.lightAnchor:isValid() then queueAnchorMove(data.lightAnchor, data.lightAnchor.cell, data.pos, data.projectile) end
             if data.soundAnchor and data.soundAnchor:isValid() then queueAnchorMove(data.soundAnchor, data.soundAnchor.cell, data.pos, data.projectile) end
-            if canCreateAnchor(data) then pauseWork.lights[data.projectile.id] = data end
+            if canCreateAnchor(data) then MagExpState.pauseWork.lights[data.projectile.id] = data end
         end,
 MagExp_CastStart = function(data)
     local attacker = data and data.attacker
@@ -6742,9 +7480,7 @@ MagExp_CastStart = function(data)
     end
 
     -- Ensure NPCs can respond to AddVfx/RemoveVfx (player already can)
-    if attacker.type ~= types.Player then
-        addScriptOnce(attacker, 'scripts/OMW_MagExp/magexp_actor_vfx.lua')
-    end
+    ensureActorVfxHandler(attacker)
 
     local function modelFromStaticId(staticId)
         if not staticId or staticId == "" then return nil end
@@ -6979,7 +7715,7 @@ end,
         --- Internal: Sync physics updates from local to global registry
         MagExp_UpdateRegistry = function(data)
             if not data or not data.projId then return end
-            local e = activeSpellRegistry[data.projId]
+            local e = MagExpState.activeProjectiles[data.projId]
             if e then
                 if data.maxSpeed then e.maxSpeed = data.maxSpeed end
                 if data.spellId  then e.spellId  = data.spellId  end
@@ -6990,40 +7726,80 @@ end,
 MagExp_RemoveObject = function(obj)
     if not obj or not obj:isValid() then return end
     local projectileId = obj.id
-    pauseWork.moves[projectileId] = nil
-    pauseWork.sounds[projectileId] = nil
-    pauseWork.lights[projectileId] = nil
-    pauseWork.anchors[projectileId] = nil
-    if pauseWork.anchorFailures then pauseWork.anchorFailures[projectileId] = nil end
+    MagExpState.pauseWork.moves[projectileId] = nil
+    MagExpState.pauseWork.sounds[projectileId] = nil
+    MagExpState.pauseWork.lights[projectileId] = nil
+    MagExpState.pauseWork.anchors[projectileId] = nil
+    if MagExpState.pauseWork.anchorFailures then MagExpState.pauseWork.anchorFailures[projectileId] = nil end
     creationOwnership.retire(obj, 'requested removal')
 end,
 
+        --- A cast breaks the caster's invisibility, exactly like an attack
+        --- does in vanilla. Sent by OSSC at the commit point of a quick-cast
+        --- (and by anything else that wants the same rule), so the target here
+        --- is the CASTER: remove the invisibility it was hiding behind.
+        ---
+        --- Read through `effectKindProbe` rather than by hand, because the
+        --- hand-rolled version missed two real cases:
+        ---
+        ---   * an enchantment-sourced invisibility — only
+        ---     `core.magic.spells.records` was searched, so a spell-enchantment
+        ---     active on the actor matched nothing and casting did not reveal
+        ---     it;
+        ---   * an entry whose effects could not be read — the record was looked
+        ---     up only when the entry carried no effect list at all.
+        ---
+        --- Constant-effect (`fromEquipment`) invisibility is deliberately left
+        --- alone: the engine re-applies it every mechanics tick, so removing it
+        --- would only produce a respawn loop — and a constant effect is not
+        --- "broken by casting" in vanilla either.
         MagExp_BreakInvisibility = function(data)
-            local actor = data.actor
+            local actor = data and data.actor
             if not actor or not actor:isValid() then return end
             local activeSpells = types.Actor.activeSpells(actor)
-            if activeSpells then
-                for spellId, spellInst in pairs(activeSpells) do
-                    local hasInvis = false
-                    local effsToCheck = spellInst.effects
-                    if not effsToCheck then
-                        local rId = spellInst.id or spellId
-                        local rSpell = core.magic.spells.records[rId]
-                        if rSpell then effsToCheck = rSpell.effects end
+            if not activeSpells or type(activeSpells.remove) ~= 'function' then return end
+            local removals = nil
+            local function isInvisibility(effKey)
+                return effKey == effectKindProbe.normaliseEffectId('invisibility')
+            end
+            local function recordHasInvisibility(record)
+                if not (record and record.effects) then return false end
+                for _, eff in pairs(record.effects) do
+                    local rawId = eff and (eff.id or eff.effectId)
+                    if rawId ~= nil and isInvisibility(effectKindProbe.normaliseEffectId(rawId)) then
+                        return true
                     end
-                    if effsToCheck then
-                        for _, eff in pairs(effsToCheck) do
-                            local eId = eff.id or eff.effectId
-                            if type(eId) == "string" and eId:lower() == "invisibility" then
-                                hasInvis = true; break
-                            end
+                end
+                return false
+            end
+            for key, spellInst in pairs(activeSpells) do
+                if type(spellInst) == 'table' and spellInst.fromEquipment then
+                    -- Constant effect: the engine owns it (see above).
+                else
+                    local ids, readable = effectKindProbe.readEntryEffectIds(spellInst, isInvisibility)
+                    local hasInvis = ids ~= nil and next(ids) ~= nil
+                    if not readable then
+                        -- The entry's own effect list is not readable, so the
+                        -- record it came from is the only answer left. Both a
+                        -- spell and an enchantment are looked at: a constant
+                        -- item's invisibility is an ENCHANTMENT, which the
+                        -- spell-only lookup used to miss.
+                        local rid = (type(spellInst) == 'table' and spellInst.id) or key
+                        if rid ~= nil then
+                            hasInvis = recordHasInvisibility(core.magic.spells.records[rid])
+                                or recordHasInvisibility(core.magic.enchantments.records[rid])
                         end
                     end
                     if hasInvis then
-                        local removeId = spellInst.activeSpellId or spellInst.id or spellId
-                        activeSpells:remove(removeId)
+                        local removeId = (type(spellInst) == 'table'
+                            and (spellInst.activeSpellId or spellInst.id)) or key
+                        removals = removals or {}
+                        removals[#removals + 1] = removeId
                     end
                 end
+            end
+            for _, removeId in ipairs(removals or {}) do
+                activeSpells:remove(removeId)
             end
         end,
     }

@@ -23,6 +23,17 @@ local SkillModes = require('scripts/OMW_MagExp/magexp_skillmodes')
 local LocalEquip = require('scripts/OMW_MagExp/magexp_local_equip')
 local debugLog = require('scripts/OMW_MagExp/magexp_logger').new('[MagExp-Player]')
 
+-- Where a hit static goes: exactly where Spell Framework Plus put it.
+--
+-- `Animation::addEffect` parents a boneless effect to the object node
+-- (mInsert) and the vanilla hit statics are authored so that, parented there,
+-- they bloom around the middle of the body -- this handler's stock placement is
+-- the reference every other placement is measured against ("it lands properly
+-- on the player", reported in-game). A relative transform only ever moved the
+-- flash above the head, so none is applied here, and none is applied to actors
+-- either (see magexp_actor_vfx.lua / OSSC's ossc_actor_hit_vfx.lua, which pass
+-- the sender's options through unchanged for the same reason).
+
 
 -- ---- State Management ----
 local busyUntil        = 0
@@ -309,8 +320,17 @@ local function onTextKey(groupname, key)
     local action = snd or k      -- "start", "release", "stop", etc.
     local targetType = snd and fst or nil -- "self", "target", "touch"
 
-    -- VFX ONLY on the initial cast group's 'start' key
-    if action == "start" then
+    -- Stance transitions also emit an `equip start` key for the `spellcast`
+    -- group. Hotkey mods (including Zerkish Hotkeys Improved) can use that
+    -- animation just to select a spell / ready Spell stance; it is not a cast
+    -- and must not spawn the spell's cast-start VFX. Keep the actual
+    -- self/touch/target start keys, and unqualified starts for SFP cast groups.
+    local isCastStart = action == "start"
+        and targetType ~= "equip"
+        and targetType ~= "unequip"
+
+    -- VFX only on a cast-phase start, never on an equip/unequip transition.
+    if isCastStart then
         if (shouldTriggerVfxOnStart(g) or g == "spellcast") and not vfxTriggeredThisCast then
             vfxTriggeredThisCast = true
             castStartLatched[g] = true
@@ -583,7 +603,7 @@ local handlers = {
 
         -- [SKILL] Progression from global script
         MagExp_AwardSkillProgress = function(data)
-            if not data or not data.school then return end
+            if not data then return end
 
             local skillMap = {
                 alteration  = "alteration",
@@ -594,7 +614,12 @@ local handlers = {
                 restoration = "restoration",
             }
 
-            local skillId = skillMap[data.school:lower()]
+            -- skillId alone identifies the use: 'enchant' is exactly a
+            -- CastWhenUsed ("Cast When Used") item use - see the launch
+            -- side - every other id names the school skill. Older callers
+            -- sent school only; keep understanding them.
+            local skillId = data.skillId
+                or (data.school and skillMap[data.school:lower()] or nil)
             if not skillId then
                 debugLog("Unknown school for skill progression:", tostring(data.school))
                 return
@@ -620,9 +645,16 @@ local handlers = {
                 local cost = data.cost or 0
                 local mult = section and section:get('MagickaXPMult') or 0.1
 
+                -- skillId 'enchant' is exactly a CastWhenUsed item use, so
+                -- its reward is the Use Magic Item skillGain column
+                -- (useValue1); every other skill here is a spellcast
+                -- success (useValue0).
                 local baseGain = 1.0
                 local skillRec = core.stats.Skill.records[sId]
-                if skillRec and skillRec.useValue0 then
+                local gainField = (sId == 'enchant') and 'useValue1' or 'useValue0'
+                if skillRec and skillRec[gainField] then
+                    baseGain = skillRec[gainField]
+                elseif skillRec and skillRec.useValue0 then
                     baseGain = skillRec.useValue0
                 end
 
@@ -640,10 +672,13 @@ local handlers = {
                     awardSkillXP_MagExp(sId)
                     return
                 end
-                local useType = data.isEnchant
-                    and I.SkillProgression.SKILL_USE_TYPES.Enchant_UseEnchantedItem
+                -- skillId 'enchant' is exactly a CastWhenUsed item use, so
+                -- the use type comes from the skill id alone ("Cast When
+                -- Used" = Enchant_UseMagicItem).
+                local useType = (sId == 'enchant')
+                    and (I.SkillProgression.SKILL_USE_TYPES.Enchant_UseMagicItem or 1)
                     or  I.SkillProgression.SKILL_USE_TYPES.Spellcast_Success
-                
+
                 async.newUnsavableSimulationTimer(0.2, function()
                     -- A cross-mod interface call, and left unguarded on
                     -- purpose. The nil-check above already proved skillUsed
@@ -659,8 +694,11 @@ local handlers = {
                     awardSkillXP_MagExp(sId)
                     return
                 end
-                local useType = data.isEnchant
-                    and I.SkillProgression.SKILL_USE_TYPES.Enchant_UseEnchantedItem
+                -- skillId 'enchant' is exactly a CastWhenUsed item use, so
+                -- the use type comes from the skill id alone ("Cast When
+                -- Used" = Enchant_UseMagicItem).
+                local useType = (sId == 'enchant')
+                    and (I.SkillProgression.SKILL_USE_TYPES.Enchant_UseMagicItem or 1)
                     or  I.SkillProgression.SKILL_USE_TYPES.Spellcast_Success
 
                 local spellForSus = nil
@@ -705,7 +743,6 @@ local handlers = {
                     school    = data.school,
                     spellId   = data.spellId,
                     cost      = data.cost or 0,
-                    isEnchant = data.isEnchant == true,
                 })
             elseif spMode == 'magexp' then
                 awardSkillXP_MagExp(skillId)
@@ -859,8 +896,14 @@ local function defaultSkillGain(skillId, cost)
     local mult = (section and section:get('MagickaXPMult')) or 0.1
     local progress = (tonumber(cost) or 0) * mult
     if progress > 0 then return progress end
+    -- skillId 'enchant' is exactly a CastWhenUsed ("Cast When Used") item
+    -- use, so its reward is the Use Magic Item skillGain column
+    -- (useValue1); every other skill is a spellcast success (useValue0).
     local skillRec = core.stats.Skill.records[skillId]
-    return (skillRec and tonumber(skillRec.useValue0)) or 1.0
+    local gainField = (skillId == 'enchant') and 'useValue1' or 'useValue0'
+    return (skillRec and tonumber(skillRec[gainField]))
+        or (skillRec and tonumber(skillRec.useValue0))
+        or 1.0
 end
 
 --- Award spellcasting skill experience to the player.
@@ -903,9 +946,16 @@ local function awardSkillProgress(skillId, options)
         if not (I.SkillProgression and I.SkillProgression.skillUsed) then
             return false, 'no external skill-progression interface is installed'
         end
+        -- skillId 'enchant' is exactly a CastWhenUsed ("Cast When Used")
+        -- item use (no other path raises Enchant), so an unqualified
+        -- enchant award defaults to that use type; anything else is a
+        -- spellcast success.  An explicit options.useType still wins.
+        local useType = options.useType
+            or (skillId == 'enchant'
+                and (I.SkillProgression.SKILL_USE_TYPES.Enchant_UseMagicItem or 1)
+                or I.SkillProgression.SKILL_USE_TYPES.Spellcast_Success)
         I.SkillProgression.skillUsed(skillId, {
-            useType   = options.useType
-                or I.SkillProgression.SKILL_USE_TYPES.Spellcast_Success,
+            useType   = useType,
             skillGain = tonumber(options.skillGain),
         })
         debugLog(string.format('[SKILL] handed %s to I.SkillProgression.skillUsed', skillId))

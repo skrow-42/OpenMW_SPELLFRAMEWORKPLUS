@@ -84,6 +84,21 @@ local bounceEnabled      = false
 local bounceMax          = 0       -- 0 = unlimited bounces until lifetime expires
 local bounceCount        = 0
 local bouncePower        = 0.7     -- restitution coeff: 1.0 = perfect elastic, 0 = dead stop
+
+-- Lua 5.4 removed the deprecated `math.atan2` (LuaJIT and Lua 5.1-5.3 still
+-- have it), so a build without it would take the whole launch down with
+-- "attempt to call a nil value (field 'atan2')". The replacement is the same
+-- two-argument arctangent, written portably.
+local function atan2(y, x)
+    if math.atan2 then return math.atan2(y, x) end
+    if x > 0 then return math.atan(y / x) end
+    if x < 0 then
+        return math.atan(y / x) + (y >= 0 and math.pi or -math.pi)
+    end
+    if y > 0 then return math.pi / 2 end
+    if y < 0 then return -math.pi / 2 end
+    return 0
+end
 local BOUNCE_EXTRA_CLEARANCE = 20
 local BOUNCE_MAX_CLEARANCE = 72
 local BOUNCE_MIN_NORMAL_DOT = 0.22
@@ -150,7 +165,15 @@ local function stopSound()
         -- anim.removeVfx raises "Object has no animation" on an actor that has
         -- none. Ask first; the condition is queryable and there is nothing to
         -- undo when it is false.
-        if anim.hasAnimation(self) then
+        --
+        -- ...but only ask while this carrier is still in an ACTIVE cell.
+        -- `anim.hasAnimation` is `World::getAnimation`, the overload that
+        -- CREATES: on a carrier whose cell has been deactivated it pulls the
+        -- reference back into the scene -- rebuilding a whole animation set for
+        -- a dummy object -- merely to take a VFX off something that is being
+        -- torn down in the same breath. `attachProjectileVfx` guards its own
+        -- `hasAnimation` the same way, for the same reason.
+        if self:isActive() and anim.hasAnimation(self) then
             anim.removeVfx(self, boltVfxId)
         end
         boltVfxId = nil
@@ -310,6 +333,17 @@ local function onInit(data)
         -- Impact
         impactImpulse = data.impactImpulse or 0
         userData      = data.userData      or nil
+        -- A launch that asks for the bystander pass-through must name the
+        -- actor it was aimed at; without a mark the request cannot be honoured
+        -- (see passesThroughBystander) and the bolt keeps the plain collision,
+        -- which otherwise looks exactly like the setting doing nothing.
+        if type(userData) == "table" and userData.passThroughBystanders == true then
+            local mark = userData.targetObject
+            if mark == nil or mark.isValid == nil or not mark:isValid() then
+                debugLog("passThroughBystanders without a valid targetObject: "
+                    .. "the bolt keeps its plain collision")
+            end
+        end
         muteAudio     = data.muteAudio     or false
         muteLight     = data.muteLight     or false
         continuousVfx = data.continuousVfx or false
@@ -426,7 +460,7 @@ local function simulateStep(dt)
         end
         orientationState.direction = dir
         
-        local yaw   = math.atan2(dir.x, dir.y)
+        local yaw   = atan2(dir.x, dir.y)
         local pitch = math.asin(math.max(-1, math.min(1, dir.z)))
         currentRotation = util.transform.rotateZ(yaw)
                         * util.transform.rotateX(-pitch)
@@ -545,6 +579,42 @@ local function simulateStep(dt)
         return false
     end
 
+    -- "Projectiles pass through bystanders": the caller names the actor this
+    -- bolt was launched at (`userData.targetObject`) and asks for every OTHER
+    -- actor on the way to be flown through. Every other actor is a bystander
+    -- by definition, so no ray scan, radius or distance heuristic is involved
+    -- - the mark is the only thing the bolt may stop on.
+    --
+    -- This is deliberately not `piercing`: piercing applies the spell to every
+    -- actor crossed and is bounded only by a pierce budget, so it cannot be
+    -- made to stop at the intended target. Here the skipped actors are simply
+    -- removed from the raycast, exactly like a corpse, and are not affected by
+    -- the spell.
+    --
+    -- A real area spell keeps the ordinary collision (its blast has to
+    -- detonate where it lands), and a launch without a named mark keeps it
+    -- too - without the mark nothing distinguishes a bystander from the
+    -- target. `userData.ignoreActorRecordIds` remains available for launches
+    -- that only have a position to aim at.
+    local function passesThroughBystander(obj)
+        if type(userData) ~= "table" or userData.passThroughBystanders ~= true then
+            return false
+        end
+        if (tonumber(area) or 0) > 0 then
+            return false
+        end
+        -- A mark that was never named, or whose object is gone from the
+        -- caller's data, means nothing to pass through.
+        local target = userData.targetObject
+        if target == nil or target.isValid == nil or not target:isValid() then
+            return false
+        end
+        if obj == nil or obj == target or obj == attacker then
+            return false
+        end
+        return true
+    end
+
     local function buildIgnoreList()
         local ignore = { self }
         if attacker and (canHitCasterAfter == nil or lifetime < canHitCasterAfter) then
@@ -575,16 +645,18 @@ local function simulateStep(dt)
         local function castOffset(offset)
             local startPos = segmentFrom + offset
             local endPos   = startPos + dir * segmentDistance
-            -- Recast through dead actors and caller-specified allies. Adding
-            -- each skipped actor to the ray ignore list keeps the projectile's
-            -- original trajectory and still permits a valid target or wall
-            -- behind that actor to receive the collision.
+            -- Recast through dead actors, caller-specified allies and, for a
+            -- launch that asked for it, every actor that is not the one it was
+            -- aimed at. Adding each skipped actor to the ray ignore list keeps
+            -- the projectile's original trajectory and still permits a valid
+            -- target or wall behind that actor to receive the collision.
             for _ = 1, 16 do
                 local hit = castProjectileRay(startPos, endPos, ignore)
                 if not hit.hit then return nil end
                 local hitObj = hit.hitObject
                 local passThrough = isActorObject(hitObj)
-                    and (types.Actor.isDead(hitObj) or userDataIgnoresActor(hitObj))
+                    and (types.Actor.isDead(hitObj) or userDataIgnoresActor(hitObj)
+                         or passesThroughBystander(hitObj))
                 if passThrough then
                     ignore[#ignore + 1] = hitObj
                 else
